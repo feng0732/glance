@@ -149,7 +149,7 @@ type weatherColumn struct {
 }
 ```
 
-### 4.2 数据完整性检查（不满 24 条留空的原因）
+### 4.2 数据完整性检查与留空路径
 
 [widget-weather.go#L240-L284](file:///d:/fz/0601/solo-dogfeeding/code/138-glance/internal/glance/widget-weather.go#L240-L284)
 
@@ -159,8 +159,8 @@ type weatherColumn struct {
 now := time.Now().In(place.location)
 bars := make([]weatherColumn, 0, 24)        // 空切片，容量 24
 currentBar := now.Hour() / 2
-sunriseBar := ...
-sunsetBar  := ...
+sunriseBar := (time.Unix(int64(responseJson.Daily.Sunrise[0]), 0).In(place.location).Hour()) / 2
+sunsetBar  := (time.Unix(int64(responseJson.Daily.Sunset[0]),  0).In(place.location).Hour() - 1) / 2
 ```
 
 真正的聚合逻辑被包裹在一层长度守卫中：
@@ -171,9 +171,74 @@ if len(responseJson.Hourly.Temperature) == 24 {
 }
 ```
 
-**留空原因**：当 API 返回的 `Hourly.Temperature` 数组长度不等于 24 时（例如请求接近午夜、API 异常、时区边界问题导致只返回部分时段数据），整个聚合块被跳过，`bars` 切片保持为空（长度 0）。最终 `weather.Columns` 是空切片，模板中 `{{ range $i, $column := .Weather.Columns }}` 不会产生任何迭代输出，预报列区域完全空白，只有天气状况文字和体感温度仍能显示。
+**留空路径（静默降级）**：当 API 返回的 `Hourly.Temperature` 数组长度不等于 24 时（例如请求接近午夜、API 异常、时区边界问题导致只返回部分时段数据），整个聚合块被跳过，`bars` 切片保持为空（长度 0）。最终 `weather.Columns` 是空切片，模板中 `{{ range $i, $column := .Weather.Columns }}` 不会产生任何迭代输出，预报列区域完全空白，但天气状况文字和体感温度仍能正常显示。
 
 该行为是一种**静默降级策略**：不报错、不填充占位数据，直接跳过渲染。
+
+---
+
+### 4.2.1 边界风险全景：数组长度不一致与越界访问
+
+`fetchWeatherForOpenMeteoPlace` 函数中存在四处数组索引访问，但仅有一处做了长度校验，以下按执行顺序逐一分析：
+
+#### 风险 ①：Daily.Sunrise / Daily.Sunset 空数组 panic
+
+[widget-weather.go#L243-L244](file:///d:/fz/0601/solo-dogfeeding/code/138-glance/internal/glance/widget-weather.go#L243-L244)
+
+```go
+sunriseBar := (time.Unix(int64(responseJson.Daily.Sunrise[0]), 0).In(place.location).Hour()) / 2
+sunsetBar  := (time.Unix(int64(responseJson.Daily.Sunset[0]),  0).In(place.location).Hour() - 1) / 2
+```
+
+- **触发条件**：API 返回了 `daily` 字段但 `sunrise` 或 `sunset` 数组为空（长度 0）
+- **后果**：Go 运行时 `index out of range` panic，整个 Widget 更新 goroutine 崩溃，`widget.Weather` 保持 `nil`，下次 `update()` 重新尝试
+- **现实概率**：极低。Open-Meteo 在 `forecast_days=1` 时通常返回恰好 1 条日出/日落数据，但理论上极区极昼/极夜、或 API 故障时可能返回空数组
+
+#### 风险 ②：温度与降水概率长度不一致导致 panic（核心风险）
+
+[widget-weather.go#L250-L265](file:///d:/fz/0601/solo-dogfeeding/code/138-glance/internal/glance/widget-weather.go#L250-L265)
+
+```go
+if len(responseJson.Hourly.Temperature) == 24 {    // 仅校验 Temperature
+    t := responseJson.Hourly.Temperature
+    p := responseJson.Hourly.PrecipitationProbability   // ← 未校验 p 的长度
+
+    for i := 0; i < 24; i += 2 {
+        // ...
+        precipitations[i/2] = (p[i]+p[i+1])/2 > 75  // ← 直接访问 p[i] 和 p[i+1]
+    }
+}
+```
+
+- **触发条件**：`len(Temperature) == 24` 通过了守卫，但 `len(PrecipitationProbability) < 24`（例如 `nil`、长度 1、长度 23 等）
+- **后果**：`p[i]` 或 `p[i+1]` 越界 panic，整个 goroutine 崩溃
+- **现实场景**：
+  - API 返回结构异常，`hourly` 对象存在但缺少 `precipitation_probability` 字段（此时 p 为 nil 切片，长度 0）
+  - Open-Meteo 部分数据缺失，降水概率只返回了部分时段
+  - 两个字段长度分别为 24 和 N（N < 24），代码无任何防御
+
+#### 风险 ③：Temperature 长度校验不包含上界
+
+[widget-weather.go#L250](file:///d:/fz/0601/solo-dogfeeding/code/138-glance/internal/glance/widget-weather.go#L250)
+
+```go
+if len(responseJson.Hourly.Temperature) == 24 {
+    for i := 0; i < 24; i += 2 {
+        temperatures[i/2] = int(math.Round((t[i] + t[i+1]) / 2))
+```
+
+如果 `len(Temperature) > 24`，守卫不成立，bars 留空（静默降级，安全）；如果恰好等于 24，循环中 `i+1` 最大为 23，不会越界。此处逻辑是安全的。
+
+#### 风险全景汇总表
+
+| # | 代码位置 | 访问对象 | 有无长度守卫 | 异常场景 | 后果 |
+|---|---------|---------|------------|---------|------|
+| ① | L243 | `Daily.Sunrise[0]` | 无 | sunrise 数组为空 | panic |
+| ② | L244 | `Daily.Sunset[0]` | 无 | sunset 数组为空 | panic |
+| ③ | L261 | `Temperature[i]` / `[i+1]` | 有（`==24`） | 长度 != 24 | 留空降级（安全） |
+| ④ | L264 | `PrecipitationProbability[i]` / `[i+1]` | **无** | 长度 < 24 | **panic** |
+
+其中风险 ④（降水概率无校验）是最容易被触发的崩溃路径——温度长度恰好 24 但降水概率缺失或长度不足时，代码直接越界。
 
 ---
 
@@ -273,7 +338,7 @@ Scale = 1.00  →  20px + 40px  = 60px  （最高柱）
 
 ---
 
-## 五、完整执行流程
+## 五、完整执行流程与风险点
 
 ```
 initialize()
@@ -294,10 +359,28 @@ update(ctx)
           ├─ 根据 units 选定 celsius / fahrenheit
           ├─ 构造 Forecast API 请求（timezone=place.Timezone）
           ├─ now = time.Now().In(place.location) ← 时区对齐
+          │
+          ├─ ☣ 风险①：Daily.Sunrise[0] 空数组 panic（无守卫）
+          ├─ ☣ 风险②：Daily.Sunset[0]  空数组 panic（无守卫）
           ├─ 计算 CurrentColumn / SunriseColumn / SunsetColumn
-          ├─ 长度守卫：len(Hourly.Temperature) == 24？否则跳过聚合
-          ├─ 24h → 12 列聚合（温度平均 + 降水阈值判断）
-          ├─ Min-Max 归一化 → Scale（Go）
+          │
+          ├─ 长度守卫：len(Hourly.Temperature) == 24？
+          │     ├─ 否 → 跳过聚合，bars 为空 → 预报列留空（静默降级 ✔）
+          │     └─ 是 → 进入聚合循环
+          │           ├─ ☣ 风险③：PrecipitationProbability[i]/[i+1]
+          │           │            长度 < 24 时越界 panic（无守卫）
+          │           ├─ 24h → 12 列聚合（温度平均 + 降水阈值判断）
+          │           └─ Min-Max 归一化 → Scale（Go）
+          │
           ├─ 模板注入 CSS 变量 --weather-bar-height
           └─ CSS calc() 映射为 20px~60px 柱高
 ```
+
+### 崩溃与降级行为总结
+
+| 异常场景 | 是否 panic | 可见表现 |
+|---------|-----------|---------|
+| `len(Temperature) != 24` | 否 | 预报列空白，天气文字/体感正常 |
+| `len(Sunrise) == 0` 或 `len(Sunset) == 0` | **是** | 整个 Widget 更新失败，下次重试 |
+| `len(Temperature) == 24` 且 `len(Precip) < 24` | **是** | 整个 Widget 更新失败，下次重试 |
+| API 请求整体失败（网络错误） | 否 | `canContinueUpdateAfterHandlingErr` 控制，显示错误状态 |
