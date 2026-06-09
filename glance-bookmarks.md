@@ -230,30 +230,182 @@ https://...     → 无冒号，整串作为 URL 直出
 
 ## 四、配置来源
 
-### 4.1 配置文件加载链路
+### 4.1 配置文件加载完整链路
 
 ```
-glance.yml (YAML 字节流)
+磁盘文件 glance.yml (+ include 文件)
     │
-    ▼
-parseConfigVariables()   // 替换 ${ENV_VAR} 等变量
+    ▼  parseYAMLIncludes()        [config.go#242-303]
+    │  • 正则扫描 !include: / $include: 指令
+    │  • 递归读取被包含文件，保留缩进
+    │  • 最大递归深度 20
+    │  • 收集所有涉及文件路径 → includes map
     │
-    ▼
-yaml.Unmarshal → config 结构体 (config.go)
+    ▼  parseConfigVariables()     [config.go#142-187]
+    │  • 正则扫描 ${...} 占位符
+    │  • env:    读环境变量
+    │  • secret: 读 /run/secrets/<name>
+    │  • readFileFromEnv: 读环境变量指向的文件内容
+    │
+    ▼  yaml.Unmarshal → config 结构体
+    │
+    ├─ isConfigStateValid() 校验
     │
     ├─ Pages[].HeadWidgets[]
     │       └─ widgets.UnmarshalYAML()
     │
     └─ Pages[].Columns[].Widgets[]
-            └─ widgets.UnmarshalYAML()
+            └─ widgets.UnmarshalYAML()   [widget.go#95-124]
                     │
                     ▼
-            1. 读 type 字段 → newWidget("bookmarks") → &bookmarksWidget{}
-            2. node.Decode(widget) 完整解析 YAML
-            3. widget.initialize()  // 计算属性继承、缓存 HTML
+            1. 只解码 type 字段
+            2. newWidget("bookmarks") → &bookmarksWidget{}  [widget.go#36-37]
+            3. node.Decode(widget) 完整解码节点（含自定义 UnmarshalYAML）
+            4. widget.initialize()   [widget-bookmarks.go#37-73]
+               - 属性继承计算 (SameTab/HideArrow/Target)
+               - renderTemplate() 缓存 HTML
 ```
 
-### 4.2 bookmarks 配置结构（YAML → Go 映射）
+---
+
+### 4.2 多文件包含（YAML Include）
+
+#### 4.2.1 语法与匹配规则
+
+定义在 [config.go#240](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L240)，正则：
+
+```
+(?m)^([ \t]*)(?:-[ \t]*)?(?:!|\$)include:[ \t]*(.+)$
+```
+
+匹配行首（`(?m)` 多行模式），支持两种等价写法：
+
+| 写法 | 示例 |
+|------|------|
+| `!include:` | `  !include: ./bookmarks.yml` |
+| `$include:` | `  $include: bookmarks/groups.yml` |
+
+前缀 `-` 可选（作为数组项时），行首空白会被捕获用于保持缩进一致。
+
+#### 4.2.2 递归解析实现
+
+核心函数 [recursiveParseYAMLIncludes](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L246-L303)：
+
+1. **深度保护**：超过 `CONFIG_INCLUDE_RECURSION_DEPTH_LIMIT`（20）立即报错，防止循环引用死循环
+2. **路径解析**：相对路径基于**包含文件所在目录**（`mainFileDir`）解析，而非进程工作目录
+3. **缩进保持**：被包含文件内容通过 [prefixStringLines](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/utils.go#L102-L110) 在每一行前补上 include 指令前的空白字符，保证 YAML 嵌套层级正确
+4. **包含追踪**：所有被包含文件的绝对路径存入 `includes map[string]struct{}`，返回给调用方用于文件监听
+
+---
+
+### 4.3 环境变量、Secret 与文件内容注入
+
+#### 4.3.1 占位符语法
+
+正则定义在 [config.go#132](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L132)：
+
+```
+(^|.)\$\{(?:([a-zA-Z]+):)?([a-zA-Z0-9_-]+)\}
+```
+
+解析函数 [parseConfigVariables](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L142-L187) 逐字节替换，支持三种变量类型与转义：
+
+| 语法 | 类型 | 行为 |
+|------|------|------|
+| `${API_KEY}` | `env`（默认） | 读 `os.LookupEnv("API_KEY")`，变量名需匹配 `^[A-Z0-9_]+$`，不存在则报错 |
+| `${secret:api_key}` | `secret` | 读 `/run/secrets/api_key` 文件，`strings.TrimSpace` 后返回（Docker Swarm / Kubernetes secret 标准路径） |
+| `${readFileFromEnv:SECRET_PATH}` | `readFileFromEnv` | 先读环境变量 `SECRET_PATH` 获取文件路径，**要求绝对路径**，再读取该文件内容 |
+| `\${API_KEY}` | 转义 | 反斜杠前缀：输出字面量 `${API_KEY}`，反斜杠本身被剥离 |
+
+若变量名不匹配 `^[A-Z0-9_]+$` 规则，函数返回原值（`returnOriginal=true`），不做替换也不报错。
+
+#### 4.3.2 三种类型的分发逻辑
+
+在 [parseConfigVariableOfType](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L190-L234) 的 `switch` 中：
+
+```
+variableType == "env"
+  └─ os.LookupEnv(name) → 不存在报错
+
+variableType == "secret"
+  └─ os.ReadFile("/run/secrets/" + name) → TrimSpace
+
+variableType == "readFileFromEnv"
+  ├─ os.LookupEnv(name) → filePath
+  ├─ 校验 filepath.IsAbs(filePath) → 非绝对路径报错
+  └─ os.ReadFile(filePath)
+```
+
+所有读取失败都会通过闭包 `err` 变量向上冒泡，导致整个配置加载失败。
+
+---
+
+### 4.4 本地图标静态资源地址来源
+
+图标地址存在**两套并行的静态资源系统**，来源不同，URL 路径不同：
+
+#### 4.4.1 编译期内嵌静态资源（/static/）
+
+实现于 [embed.go](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/embed.go#L20-L81)：
+
+```go
+//go:embed static
+var _staticFS embed.FS
+
+var staticFS, _ = fs.Sub(_staticFS, "static")
+```
+
+编译时 `internal/glance/static/` 目录整体打包进二进制。服务启动时计算所有内嵌文件的 MD5 哈希取前 10 位作为 `staticFSHash`，用于 HTTP 缓存击穿：
+
+```
+/static/{hash}/icons/github.svg
+/static/{hash}/css/main.css
+/static/{hash}/fonts/JetBrainsMono-Regular.woff2
+```
+
+路由注册在 [glance.go#459-465](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/glance.go#L459-L465)，缓存策略 `STATIC_ASSETS_CACHE_DURATION`。
+
+提供给 Widget 使用的解析函数 [StaticAssetPath](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/glance.go#L427-L429)：
+
+```go
+func (a *application) StaticAssetPath(asset string) string {
+    return a.Config.Server.BaseURL + "/static/" + staticFSHash + "/" + asset
+}
+```
+
+此函数被包装为 `assetResolver` 注入到 [widgetProviders](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/widget.go#L169-L171)，供 releases 等 Widget 解析内置图标使用（bookmarks Widget 不直接使用它，bookmarks 的图标走用户自定义 URL 或 CDN）。
+
+#### 4.4.2 用户自定义资源目录（/assets/）
+
+用户可在配置中指定：
+
+```yaml
+server:
+  assets-path: /home/user/my-glance-assets
+```
+
+实现于 [glance.go#484-489](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/glance.go#L484-L489)：
+
+```go
+if a.Config.Server.AssetsPath != "" {
+    assetsFS := fileServerWithCache(http.Dir(a.Config.Server.AssetsPath), 2*time.Hour)
+    mux.Handle("/assets/{path...}", http.StripPrefix("/assets/", assetsFS))
+}
+```
+
+直接使用 `http.Dir` 暴露用户目录，缓存 2 小时。**bookmarks 中引用本地图标需写完整 URL 路径**，例如：
+
+```yaml
+icon: /assets/my-custom-icon.png     # 用户自定义目录
+icon: si:github                       # Simple Icons CDN（见 2.2 节）
+icon: https://example.com/icon.svg    # 任意远程 URL
+```
+
+注意：bookmarks 的 `customIconField` 不经过 `assetResolver`，只做前缀匹配和 URL 透传，所以 `/assets/...` 路径需用户手动写出完整前缀。
+
+---
+
+### 4.5 bookmarks 配置结构（YAML → Go 映射）
 
 | YAML 路径 | Go 字段 | 类型 | 解析器 |
 |-----------|---------|------|--------|
@@ -265,12 +417,12 @@ yaml.Unmarshal → config 结构体 (config.go)
 | `groups[].links[].title` | `Link.Title` | string | 标准 |
 | `groups[].links[].url` | `Link.URL` | string | 标准 |
 | `groups[].links[].description` | `Link.Description` | string | 标准 |
-| `groups[].links[].icon` | `Link.Icon` | `customIconField` | 自定义 UnmarshalYAML |
-| `groups[].links[].same-tab` | `Link.SameTabRaw` | `*bool` | 指针区分「未设置」 |
-| `groups[].links[].hide-arrow` | `Link.HideArrowRaw` | `*bool` | 指针区分「未设置」 |
+| `groups[].links[].icon` | `Link.Icon` | `customIconField` | 自定义 UnmarshalYAML（见 2.2 节） |
+| `groups[].links[].same-tab` | `Link.SameTabRaw` | `*bool` | 指针区分「未设置」与「显式 false」 |
+| `groups[].links[].hide-arrow` | `Link.HideArrowRaw` | `*bool` | 指针区分「未设置」与「显式 false」 |
 | `groups[].links[].target` | `Link.Target` | string | 标准 |
 
-### 4.3 hslColorField 颜色解析
+### 4.6 hslColorField 颜色解析
 
 定义在 [config-fields.go#25-94](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config-fields.go#L25-L94)。支持以下等价格式：
 
@@ -281,19 +433,75 @@ yaml.Unmarshal → config 结构体 (config.go)
 "230,100,30"
 ```
 
-正则表达式：`^(?:hsla?\()?([\d\.]+)(?: |,)+([\d\.]+)%?(?: |,)+([\d\.]+)%?\)?$`
+正则：`^(?:hsla?\()?([\d\.]+)(?: |,)+([\d\.]+)%?(?: |,)+([\d\.]+)%?\)?$`
 
-三值范围校验：H ∈ [0, 360]，S ∈ [0, 100]，L ∈ [0, 100]。
+范围校验：H ∈ [0, 360]，S ∈ [0, 100]，L ∈ [0, 100]。`String()` 方法序列化为标准 `hsl(H, S%, L%)` 格式注入 CSS 变量。
 
-### 4.4 Widget 创建与分发
+### 4.7 Widget 创建与分发
 
-在 [widget.go#newWidget](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/widget.go#L20-L91) 的 `switch` 语句中，`"bookmarks"` case 返回 `&bookmarksWidget{}`，并分配自增 ID。
+在 [widget.go#newWidget](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/widget.go#L20-L91) 的 `switch` 语句中，`"bookmarks"` case 返回 `&bookmarksWidget{}`，并分配自增 ID（`atomic.Uint64`）。
 
-[widgets.UnmarshalYAML](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/widget.go#L95-L124) 采用**两阶段解析**：先只解析出 `type` 字段创建具体类型，再将整个节点解码到该实例，确保 YAML tag 被正确路由。
+[widgets.UnmarshalYAML](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/widget.go#L95-L124) 采用**两阶段解析**：先只读 `type` 字段创建具体类型实例，再将整个 YAML 节点 `Decode` 到该实例，从而触发各字段的自定义 `UnmarshalYAML`（如 `customIconField`、`hslColorField`、`*bool` 指针）。
 
-### 4.5 配置热加载
+---
 
-在 [config.go](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go) 中通过 `fsnotify` 监听配置文件变更，修改后自动重新执行上述整个加载流程。若新配置解析失败，保留旧配置继续运行并在控制台输出错误。
+### 4.8 配置变更热重载与旧配置保留
+
+#### 4.8.1 文件监听启动
+
+入口在 [main.go#152-177](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/main.go#L152-L177)：
+
+```go
+configContents, configIncludes, err := parseYAMLIncludes(configPath)
+stopWatching, err := configFilesWatcher(configPath, configContents, configIncludes, onChange, onErr)
+```
+
+若 watcher 启动失败（如某些平台不支持 fsnotify），降级为单次加载并启动服务，不再监听变更。
+
+#### 4.8.2 watcher 内部逻辑
+
+[configFilesWatcher](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L305-L445) 的核心行为：
+
+| 事件 | 处理 |
+|------|------|
+| `fsnotify.Write` | 触发 debounce（500ms）→ 重新 parseYAMLIncludes → 内容比对 |
+| `fsnotify.Rename` | Linux 下重命名后文件不再被 watch：等待最多 2 秒（10 × 200ms）看文件是否重新出现，然后走完整比对 |
+| `fsnotify.Remove` | 从 includes 中移除，走完整比对 |
+
+每次变更后 [parseAndCompareBeforeCallback](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L349-L371) 做三件事：
+1. 重新 `parseYAMLIncludes` 得到 `currentContents` 与 `currentIncludes`
+2. 比对 includes set：有增删则调用 `watcher.Add / watcher.Remove` 动态更新监听列表
+3. 比对字节内容 `bytes.Equal(lastContents, currentContents)`：不同才触发 `onChange`
+
+所有状态操作（`lastContents`、`lastIncludes`）受 `sync.Mutex` 保护，避免多 goroutine 竞态。
+
+#### 4.8.3 onChange 回调：旧配置保留机制
+
+[main.go#onChange](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/main.go#L101-L146) 是旧配置保留的核心：
+
+```
+onChange(newContents []byte)
+│
+├─ newConfigFromYAML(newContents)
+│     ├─ 成功 → 继续
+│     └─ 失败（parseConfigVariables / yaml.Unmarshal / 校验 / initialize 任一环节报错）
+│           ├─ hadValidConfigOnStartup == false → close(exitChannel) 进程退出
+│           └─ hadValidConfigOnStartup == true  →  【关键】return，不做任何替换
+│                                                    旧 app / 旧 server 毫发无损继续运行
+│
+├─ newApplication(config)
+│     ├─ 成功 → 继续
+│     └─ 失败 → 同上：首次启动才退出，否则 return 保留旧配置
+│
+├─ hadValidConfigOnStartup = true   // 标记已有有效配置
+│
+└─ stopServer()      // 停掉旧 HTTP server
+    new app.server() // 启动新 server（替换 stopServer 闭包）
+```
+
+**结论**：只要进程曾经成功启动过一次（`hadValidConfigOnStartup=true`），之后任何配置变更导致的解析错误、校验错误、初始化错误都只会在日志中输出 `Config has errors: ...`，**旧的 application 与 HTTP server 完全不受影响**，直到用户修复配置并保存后才会触发下一次成功替换。
+
+初次启动时若配置无效则直接退出（无旧配置可保留），这是 `!hadValidConfigOnStartup` 分支的唯一用途。
 
 ---
 
@@ -302,10 +510,14 @@ yaml.Unmarshal → config 结构体 (config.go)
 | 文件 | 作用 |
 |------|------|
 | [widget-bookmarks.go](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/widget-bookmarks.go) | Bookmarks Widget 结构体、属性继承、HTML 缓存 |
-| [config-fields.go](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config-fields.go) | `customIconField`（图标解析）、`hslColorField`（颜色解析） |
+| [config-fields.go](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config-fields.go) | `customIconField`（图标前缀解析）、`hslColorField`（颜色解析） |
 | [bookmarks.html](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/templates/bookmarks.html) | Go 模板：分组与链接的 DOM 结构 |
 | [widget-bookmarks.css](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/static/css/widget-bookmarks.css) | 分组颜色变量、图标容器样式、链接箭头 |
 | [utils.css](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/static/css/utils.css) | `.dynamic-columns` 布局均衡、`.flat-icon` 暗色反色 |
 | [mobile.css](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/static/css/mobile.css) | 移动端强制单列 |
-| [widget.go](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/widget.go) | Widget 类型注册与多态反序列化 |
-| [config.go](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go) | 顶层配置加载、变量替换、热加载 |
+| [widget.go](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/widget.go) | Widget 类型注册、多态反序列化、`widgetProviders`（assetResolver） |
+| [config.go](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go) | `parseYAMLIncludes`（多文件包含）、`parseConfigVariables`（env/secret/readFileFromEnv 注入）、`configFilesWatcher`（fsnotify 热重载） |
+| [main.go](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/main.go) | `onChange` 回调（旧配置保留逻辑、stop/start server 切换） |
+| [glance.go](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/glance.go) | `StaticAssetPath`（内嵌资源）、`/assets/` 用户自定义资源路由 |
+| [embed.go](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/embed.go) | `//go:embed static` 二进制内嵌、`staticFSHash` 计算 |
+| [utils.go](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/utils.go) | `prefixStringLines`（include 缩进保持） |
