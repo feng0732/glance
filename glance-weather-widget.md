@@ -380,7 +380,151 @@ update(ctx)
 
 | 异常场景 | 是否 panic | 可见表现 |
 |---------|-----------|---------|
-| `len(Temperature) != 24` | 否 | 预报列空白，天气文字/体感正常 |
-| `len(Sunrise) == 0` 或 `len(Sunset) == 0` | **是** | 整个 Widget 更新失败，下次重试 |
-| `len(Temperature) == 24` 且 `len(Precip) < 24` | **是** | 整个 Widget 更新失败，下次重试 |
+| `len(Temperature) != 24` | 否 | 预报列空白，天气文字/体感正常（静默降级） |
+| `len(Sunrise) == 0` 或 `len(Sunset) == 0` | **是** | **整个进程崩溃退出**（详见第六章） |
+| `len(Temperature) == 24` 且 `len(Precip) < 24` | **是** | **整个进程崩溃退出**（详见第六章） |
 | API 请求整体失败（网络错误） | 否 | `canContinueUpdateAfterHandlingErr` 控制，显示错误状态 |
+
+---
+
+## 六、Goroutine 调度、Panic 传播与 Recover 缺口
+
+### 6.1 Widget 更新的 Goroutine 调度链
+
+天气 Widget 的 `update()` 并非在 HTTP 请求 goroutine 中直接执行，而是经过两层 goroutine 调度：
+
+**第 1 层：页面级并发调度**
+
+[glance.go#L233-L270](file:///d:/fz/0601/solo-dogfeeding/code/138-glance/internal/glance/glance.go#L233-L270)
+
+每当浏览器请求页面内容（`/api/pages/{page}/content`）时，`handlePageContentRequest` 会调用 `page.updateOutdatedWidgets()`，该函数遍历所有 Head Widgets 和 Column Widgets，为每一个需要更新的 Widget 启动独立 goroutine：
+
+```go
+func (p *page) updateOutdatedWidgets() {
+    now := time.Now()
+    var wg sync.WaitGroup
+    ctx := context.Background()
+
+    for w := range p.HeadWidgets {
+        widget := p.HeadWidgets[w]
+        if !widget.requiresUpdate(&now) { continue }
+        wg.Add(1)
+        go func() {
+            defer wg.Done()        // ← 仅注册 Done，无 recover
+            widget.update(ctx)     // ← weatherWidget.update() 在此执行
+        }()
+    }
+    // Columns 中的 Widgets 同样模式启动 goroutine
+    wg.Wait()
+}
+```
+
+**第 2 层：容器级嵌套调度（可选）**
+
+[widget-container.go#L23-L42](file:///d:/fz/0601/solo-dogfeeding/code/138-glance/internal/glance/widget-container.go#L23-L42)
+
+若天气 Widget 被放在 Group 或 Split-Column 容器内，则容器的 `_update()` 方法会为每个子 Widget 再启动一层独立 goroutine，结构与第 1 层完全相同——同样只有 `defer wg.Done()`，没有 recover。
+
+**调用链全景**：
+
+```
+HTTP 请求 goroutine
+    └─ handlePageContentRequest
+         ├─ page.mu.Lock()
+         └─ page.updateOutdatedWidgets()
+              ├─ goroutine A: widget.update()  ← 天气 Widget（顶层）
+              │    └─ weatherWidget.update()
+              │         └─ fetchWeatherForOpenMeteoPlace()
+              │              └─ ☣ 数组越界 panic
+              ├─ goroutine B: widget.update()  ← 其他 Widget
+              ├─ goroutine C: containerWidget.update()
+              │    └─ containerWidgetBase._update()
+              │         ├─ goroutine C1: subWidget.update()
+              │         └─ goroutine C2: weatherWidget.update()  ← 嵌套的天气 Widget
+              │              └─ ☣ 数组越界 panic
+              └─ wg.Wait()
+```
+
+### 6.2 Panic 传播路径与影响范围
+
+在 Go 语言中，**panic 仅在当前 goroutine 内传播，不能跨 goroutine 被父 goroutine 的 recover 捕获**。结合代码分析传播路径：
+
+```
+goroutine A（天气 Widget 更新）
+    │
+    ├─ weatherWidget.update(ctx)
+    │    └─ fetchWeatherForOpenMeteoPlace()
+    │         ├─ ☣ p[i] 越界 / Sunrise[0] 越界
+    │         │
+    │         └─ panic("index out of range")
+    │              │
+    │              ▼
+    │         栈展开，执行 defer wg.Done()  ✔ WaitGroup 会计数减 1
+    │              │
+    │              ▼
+    │         无 recover → goroutine A 终止
+    │              │
+    │              ▼
+    │         Go runtime 检测到未恢复 panic → **整个进程终止**
+    │
+    ├─ goroutine B（其他 Widget） → 随进程一同被杀死
+    ├─ goroutine C（容器）       → 随进程一同被杀死
+    └─ wg.Wait()                 → 永远不会返回（进程已死）
+```
+
+**关键影响点**：
+
+| 影响对象 | 行为 |
+|---------|------|
+| WaitGroup | `defer wg.Done()` 在 panic 展开时仍会执行，计数会减 1，不会永久阻塞 |
+| page.mu 互斥锁 | 锁在 HTTP 请求 goroutine 中（不在子 goroutine 内），进程死亡后锁自然消失，无死锁 |
+| 其他 Widget | 同一次请求中正在更新的其他 goroutine 全部被 runtime 杀死，可能部分更新到一半 |
+| HTTP 响应 | `handlePageContentRequest` 所在 goroutine 也随进程终止，客户端收到连接被重置 |
+| 后续请求 | 进程退出，服务停止，所有用户均无法访问 |
+| 下次"重试" | **不存在重试**。进程已死，需由外部进程管理器（systemd / Docker）重启 |
+
+之前对"整个 Widget 更新失败，下次重试"的理解是**错误的**——数组越界 panic 会导致 Glance **整个进程崩溃退出**，而不是仅单个 Widget 失败。
+
+### 6.3 Recover 缺口盘点
+
+对整个代码库搜索 `recover` 关键字，仅在一处发现相关注释：
+
+[widget-custom-api.go#L223](file:///d:/fz/0601/solo-dogfeeding/code/138-glance/internal/glance/widget-custom-api.go#L223) 中提到 `// handles recovering from panics`，但这是 Custom API Widget 内部执行用户自定义脚本时使用的局部 recover，不覆盖 Widget update 入口。
+
+**三层 goroutine 启动位置均无 recover**：
+
+| 位置 | 代码 | 是否有 recover |
+|------|------|--------------|
+| `page.updateOutdatedWidgets()` [glance.go#L247-L250](file:///d:/fz/0601/solo-dogfeeding/code/138-glance/internal/glance/glance.go#L247-L250) | `go func() { defer wg.Done(); widget.update(ctx) }()` | ❌ 无 |
+| `page.updateOutdatedWidgets()` [glance.go#L262-L265](file:///d:/fz/0601/solo-dogfeeding/code/138-glance/internal/glance/glance.go#L262-L265) | （Column Widgets 同一模式） | ❌ 无 |
+| `containerWidgetBase._update()` [widget-container.go#L35-L38](file:///d:/fz/0601/solo-dogfeeding/code/138-glance/internal/glance/widget-container.go#L35-L38) | `go func() { defer wg.Done(); widget.update(ctx) }()` | ❌ 无 |
+
+同时，`main()` → `glance.Main()` → `serveApp()` 的启动链路上也没有全局 panic 恢复机制。
+
+### 6.4 从数组越界到进程死亡的完整时间线
+
+```
+T+0ms   用户浏览器请求 /api/pages/home/content
+T+1ms   handlePageContentRequest 获取 page.mu 锁，调用 updateOutdatedWidgets()
+T+2ms   天气 Widget 需要更新，启动 goroutine A
+T+3ms   goroutine A 执行 fetchWeatherForOpenMeteoPlace()
+        ↓
+        API 返回 len(Temperature)=24, len(PrecipitationProbability)=0
+        ↓
+        进入 if len(Temperature)==24 分支
+        ↓
+        循环 i=0: p[0] → 越界
+        ↓
+T+4ms   panic: runtime error: index out of range [0] with length 0
+        ↓
+        defer wg.Done() 执行 → WaitGroup 计数 -1
+        ↓
+        无 recover → Go runtime 开始终止所有 goroutine
+T+5ms   整个进程以非零退出码退出
+        ↓
+        用户浏览器显示连接被重置（ECONNRESET）
+        ↓
+        其他正在浏览的用户也全部断开
+        ↓
+        systemd / Docker 根据重启策略决定是否拉起新进程
+```
