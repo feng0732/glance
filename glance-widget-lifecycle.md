@@ -6,7 +6,7 @@
 
 ## 0. 核心接口与基类
 
-所有 Widget 都实现了 `widget` 接口，定义于 [`internal/glance/widget.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget.go#L126-L139)：
+所有 Widget 都实现了 `widget` 接口，定义于 [`internal/glance/widget.go`](internal/glance/widget.go#L126-L139)：
 
 ```go
 type widget interface {
@@ -23,9 +23,9 @@ type widget interface {
 }
 ```
 
-具体 Widget（如 `clockWidget`、`weatherWidget`）通过嵌入 `widgetBase` 结构体获得默认实现。`widgetBase` 定义于 [`internal/glance/widget.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget.go#L149-L167)，持有 ID、缓存策略、错误状态、渲染缓冲区。
+具体 Widget（如 `clockWidget`、`weatherWidget`）通过嵌入 `widgetBase` 结构体获得默认实现。`widgetBase` 定义于 [`internal/glance/widget.go`](internal/glance/widget.go#L149-L167)，持有 ID、缓存策略、错误状态、渲染缓冲区。
 
-容器型 Widget（`groupWidget`、`splitColumnWidget`）额外嵌入 `containerWidgetBase`，定义于 [`internal/glance/widget-container.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget-container.go#L9-L11)，持有 `Widgets widgets` 子节点列表。
+容器型 Widget（`groupWidget`、`splitColumnWidget`）额外嵌入 `containerWidgetBase`，定义于 [`internal/glance/widget-container.go`](internal/glance/widget-container.go#L9-L11)，持有 `Widgets widgets` 子节点列表。
 
 ---
 
@@ -49,7 +49,7 @@ pages:
               - type: bookmarks
 ```
 
-配置加载始于 [`internal/glance/config.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/config.go)。
+配置加载始于 [`internal/glance/config.go`](internal/glance/config.go)。
 
 ### 1.2 反序列化触发点
 
@@ -57,7 +57,7 @@ pages:
 
 ### 1.3 `widgets.UnmarshalYAML`
 
-方法定义于 [`internal/glance/widget.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget.go#L95-L124)。
+方法定义于 [`internal/glance/widget.go`](internal/glance/widget.go#L95-L124)。
 
 执行流程：
 
@@ -84,7 +84,7 @@ func (w *widgets) UnmarshalYAML(node *yaml.Node) error {
 
 ### 1.4 `newWidget`：类型注册表
 
-函数定义于 [`internal/glance/widget.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget.go#L20-L91)，本质是一个巨大的 switch 语句——所有 Widget 类型的硬编码注册中心：
+函数定义于 [`internal/glance/widget.go`](internal/glance/widget.go#L20-L91)，本质是一个巨大的 switch 语句——所有 Widget 类型的硬编码注册中心：
 
 ```go
 func newWidget(widgetType string) (widget, error) {
@@ -112,7 +112,7 @@ func newWidget(widgetType string) (widget, error) {
 
 ### 2.1 触发时机
 
-配置反序列化完成后，`newConfigFromYAML` 在 [`internal/glance/config.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/config.go#L112-L126) 遍历所有 Page 的 HeadWidgets 和 Columns 中的**顶层** Widget，逐个调用 `initialize()`：
+配置反序列化完成后，`newConfigFromYAML` 在 [`internal/glance/config.go`](internal/glance/config.go#L112-L126) 遍历所有 Page 的 HeadWidgets 和 Columns 中的**顶层** Widget，逐个调用 `initialize()`：
 
 ```go
 for p := range config.Pages {
@@ -131,7 +131,7 @@ for p := range config.Pages {
 
 ### 2.2 典型 `initialize()` 实现
 
-以 `weatherWidget.initialize()` 为例，定义于 [`internal/glance/widget-weather.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget-weather.go#L35-L57)：
+以 `weatherWidget.initialize()` 为例，定义于 [`internal/glance/widget-weather.go`](internal/glance/widget-weather.go#L35-L57)：
 
 ```go
 func (widget *weatherWidget) initialize() error {
@@ -144,7 +144,7 @@ func (widget *weatherWidget) initialize() error {
 }
 ```
 
-以 `clockWidget.initialize()` 为例，定义于 [`internal/glance/widget-clock.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget-clock.go#L22-L44)：
+以 `clockWidget.initialize()` 为例，定义于 [`internal/glance/widget-clock.go`](internal/glance/widget-clock.go#L22-L44)：
 
 ```go
 func (widget *clockWidget) initialize() error {
@@ -157,7 +157,7 @@ func (widget *clockWidget) initialize() error {
 
 ### 2.3 容器型 Widget 的初始化递归链
 
-以 `groupWidget.initialize()` 为例，定义于 [`internal/glance/widget-group.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget-group.go#L17-L36)：
+以 `groupWidget.initialize()` 为例，定义于 [`internal/glance/widget-group.go`](internal/glance/widget-group.go#L17-L36)：
 
 ```go
 func (widget *groupWidget) initialize() error {
@@ -175,7 +175,7 @@ func (widget *groupWidget) initialize() error {
 }
 ```
 
-`_initializeWidgets()` 定义于 [`internal/glance/widget-container.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget-container.go#L13-L21)：
+`_initializeWidgets()` 定义于 [`internal/glance/widget-container.go`](internal/glance/widget-container.go#L13-L21)：
 
 ```go
 func (widget *containerWidgetBase) _initializeWidgets() error {
@@ -188,7 +188,7 @@ func (widget *containerWidgetBase) _initializeWidgets() error {
 }
 ```
 
-`splitColumnWidget.initialize()` 同理，定义于 [`internal/glance/widget-split-column.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget-split-column.go#L17-L29)，同样调用 `_initializeWidgets()`。
+`splitColumnWidget.initialize()` 同理，定义于 [`internal/glance/widget-split-column.go`](internal/glance/widget-split-column.go#L17-L29)，同样调用 `_initializeWidgets()`。
 
 **递归初始化链**：
 ```
@@ -222,7 +222,7 @@ page level initialize() 顶层遍历
 
 ### 3.1 注册表结构
 
-`application` 结构体持有运行时注册表，定义于 [`internal/glance/glance.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/glance.go#L30-L45)：
+`application` 结构体持有运行时注册表，定义于 [`internal/glance/glance.go`](internal/glance/glance.go#L30-L45)：
 
 ```go
 type application struct {
@@ -235,7 +235,7 @@ type application struct {
 
 ### 3.2 初始化位置
 
-在 `newApplication()` 中创建空 map，见 [`internal/glance/glance.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/glance.go#L47-L54)：
+在 `newApplication()` 中创建空 map，见 [`internal/glance/glance.go`](internal/glance/glance.go#L47-L54)：
 
 ```go
 app := &application{
@@ -246,7 +246,7 @@ app := &application{
 
 ### 3.3 注册过程
 
-`newApplication()` 在 [`internal/glance/glance.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/glance.go#L153-L194) 遍历所有 Page 的**顶层** Widget 进行注册：
+`newApplication()` 在 [`internal/glance/glance.go`](internal/glance/glance.go#L153-L194) 遍历所有 Page 的**顶层** Widget 进行注册：
 
 ```go
 for p := range config.Pages {
@@ -291,7 +291,7 @@ for p := range config.Pages {
 widget.setProviders(providers)
 ```
 
-**容器递归注入**（以 `groupWidget` 为例），见 [`internal/glance/widget-group.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget-group.go#L42-L44)：
+**容器递归注入**（以 `groupWidget` 为例），见 [`internal/glance/widget-group.go`](internal/glance/widget-group.go#L42-L44)：
 
 ```go
 func (widget *groupWidget) setProviders(providers *widgetProviders) {
@@ -299,9 +299,9 @@ func (widget *groupWidget) setProviders(providers *widgetProviders) {
 }
 ```
 
-`splitColumnWidget.setProviders()` 同理，见 [`internal/glance/widget-split-column.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget-split-column.go#L35-L37)。
+`splitColumnWidget.setProviders()` 同理，见 [`internal/glance/widget-split-column.go`](internal/glance/widget-split-column.go#L35-L37)。
 
-`_setProviders()` 定义于 [`internal/glance/widget-container.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget-container.go#L44-L48)：
+`_setProviders()` 定义于 [`internal/glance/widget-container.go`](internal/glance/widget-container.go#L44-L48)：
 
 ```go
 func (widget *containerWidgetBase) _setProviders(providers *widgetProviders) {
@@ -329,8 +329,8 @@ newApplication() setProviders (顶层)
 用户浏览器请求页面时采用两段式渲染：
 
 1. **服务端输出骨架**：`handlePageRequest` 渲染 `page.html`，页面内 `<div id="page-content">` 是空容器
-2. **前端异步拉内容**：JS `setupPage()` 在 [`internal/glance/static/js/page.js`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/static/js/page.js#L746-L784) 异步请求 `/api/pages/{page}/content/`
-3. **服务端渲染内容**：`handlePageContentRequest` 在 [`internal/glance/glance.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/glance.go#L334-L367) 处理：
+2. **前端异步拉内容**：JS `setupPage()` 在 [`internal/glance/static/js/page.js`](internal/glance/static/js/page.js#L746-L784) 异步请求 `/api/pages/{page}/content/`
+3. **服务端渲染内容**：`handlePageContentRequest` 在 [`internal/glance/glance.go`](internal/glance/glance.go#L334-L367) 处理：
 
 ```go
 func (a *application) handlePageContentRequest(...) {
@@ -344,7 +344,7 @@ func (a *application) handlePageContentRequest(...) {
 
 ### 4.2 `page.updateOutdatedWidgets()`
 
-定义于 [`internal/glance/glance.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/glance.go#L233-L270)：
+定义于 [`internal/glance/glance.go`](internal/glance/glance.go#L233-L270)：
 
 ```go
 func (p *page) updateOutdatedWidgets() {
@@ -383,7 +383,7 @@ func (p *page) updateOutdatedWidgets() {
 
 与 `initialize` 和 `setProviders` 相同，容器型 Widget 的 `update()` 也会递归调度子 Widget。
 
-以 `groupWidget.update()` 为例，见 [`internal/glance/widget-group.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget-group.go#L38-L40)：
+以 `groupWidget.update()` 为例，见 [`internal/glance/widget-group.go`](internal/glance/widget-group.go#L38-L40)：
 
 ```go
 func (widget *groupWidget) update(ctx context.Context) {
@@ -391,9 +391,9 @@ func (widget *groupWidget) update(ctx context.Context) {
 }
 ```
 
-`splitColumnWidget.update()` 同理，见 [`internal/glance/widget-split-column.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget-split-column.go#L31-L33)。
+`splitColumnWidget.update()` 同理，见 [`internal/glance/widget-split-column.go`](internal/glance/widget-split-column.go#L31-L33)。
 
-`_update()` 定义于 [`internal/glance/widget-container.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget-container.go#L23-L42)：
+`_update()` 定义于 [`internal/glance/widget-container.go`](internal/glance/widget-container.go#L23-L42)：
 
 ```go
 func (widget *containerWidgetBase) _update(ctx context.Context) {
@@ -413,7 +413,7 @@ func (widget *containerWidgetBase) _update(ctx context.Context) {
 }
 ```
 
-同样，`requiresUpdate` 也是递归的，以 `groupWidget.requiresUpdate()` 为例见 [`internal/glance/widget-group.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget-group.go#L46-L48)，其调用的 `_requiresUpdate()` 定义于 [`internal/glance/widget-container.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget-container.go#L50-L58)：只要有任意一个子 Widget 需要更新，容器就返回 `true`。
+同样，`requiresUpdate` 也是递归的，以 `groupWidget.requiresUpdate()` 为例见 [`internal/glance/widget-group.go`](internal/glance/widget-group.go#L46-L48)，其调用的 `_requiresUpdate()` 定义于 [`internal/glance/widget-container.go`](internal/glance/widget-container.go#L50-L58)：只要有任意一个子 Widget 需要更新，容器就返回 `true`。
 
 **递归 update 链**：
 ```
@@ -426,7 +426,7 @@ page.updateOutdatedWidgets() (顶层并发 goroutine)
 
 ### 4.4 `requiresUpdate()` 判断逻辑
 
-`widgetBase` 的默认实现定义于 [`internal/glance/widget.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget.go#L173-L183)：
+`widgetBase` 的默认实现定义于 [`internal/glance/widget.go`](internal/glance/widget.go#L173-L183)：
 
 ```go
 func (w *widgetBase) requiresUpdate(now *time.Time) bool {
@@ -444,7 +444,7 @@ func (w *widgetBase) requiresUpdate(now *time.Time) bool {
 
 ### 4.5 `update()` 典型实现与错误处理
 
-以 `weatherWidget.update()` 为例 [`internal/glance/widget-weather.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget-weather.go#L59-L77)：
+以 `weatherWidget.update()` 为例 [`internal/glance/widget-weather.go`](internal/glance/widget-weather.go#L59-L77)：
 
 ```go
 func (widget *weatherWidget) update(ctx context.Context) {
@@ -465,14 +465,14 @@ func (widget *weatherWidget) update(ctx context.Context) {
 }
 ```
 
-`canContinueUpdateAfterHandlingErr` 在 [`internal/glance/widget.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget.go#L293-L325)：
+`canContinueUpdateAfterHandlingErr` 在 [`internal/glance/widget.go`](internal/glance/widget.go#L293-L325)：
 - 无错误 → `scheduleNextUpdate()` 按正常策略排程下次更新
 - 部分内容错误（`errPartialContent`）→ `scheduleEarlyUpdate()` 指数退避重试，设置 Notice
 - 严重错误 → 设置 `Error` 状态，`scheduleEarlyUpdate()`
 
 ### 4.6 模板渲染
 
-`page-content.html` 模板在 [`internal/glance/templates/page-content.html`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/templates/page-content.html)：
+`page-content.html` 模板在 [`internal/glance/templates/page-content.html`](internal/glance/templates/page-content.html)：
 
 ```html
 {{ range .Page.Columns }}
@@ -484,9 +484,9 @@ func (widget *weatherWidget) update(ctx context.Context) {
 {{ end }}
 ```
 
-每个 Widget 的 `Render()` 调用 `widgetBase.renderTemplate()`，定义于 [`internal/glance/widget.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget.go#L217-L241)。
+每个 Widget 的 `Render()` 调用 `widgetBase.renderTemplate()`，定义于 [`internal/glance/widget.go`](internal/glance/widget.go#L217-L241)。
 
-`widget-base.html` 在 [`internal/glance/templates/widget-base.html`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/templates/widget-base.html) 定义了统一外壳，通过 `{{ block "widget-content" . }}` 让具体 Widget 模板覆盖内容区域。
+`widget-base.html` 在 [`internal/glance/templates/widget-base.html`](internal/glance/templates/widget-base.html) 定义了统一外壳，通过 `{{ block "widget-content" . }}` 让具体 Widget 模板覆盖内容区域。
 
 **渲染容错**：若渲染出错，`renderTemplate()` 会**立即重新执行一次模板渲染**（此时 Widget 已被设置 Error 状态），避免模板半渲染导致标签未闭合而污染整个页面。
 
@@ -496,7 +496,7 @@ func (widget *weatherWidget) update(ctx context.Context) {
 
 ### 5.1 路由注册
 
-路由注册于 [`internal/glance/glance.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/glance.go#L436-L457)：
+路由注册于 [`internal/glance/glance.go`](internal/glance/glance.go#L436-L457)：
 
 ```go
 mux.HandleFunc("/api/widgets/{widget}/{path...}", a.handleWidgetRequest)
@@ -504,7 +504,7 @@ mux.HandleFunc("/api/widgets/{widget}/{path...}", a.handleWidgetRequest)
 
 ### 5.2 当前实现
 
-`handleWidgetRequest` 定义于 [`internal/glance/glance.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/glance.go#L404-L425)：
+`handleWidgetRequest` 定义于 [`internal/glance/glance.go`](internal/glance/glance.go#L404-L425)：
 
 ```go
 func (a *application) handleWidgetRequest(w http.ResponseWriter, r *http.Request) {
@@ -527,7 +527,7 @@ func (a *application) handleWidgetRequest(w http.ResponseWriter, r *http.Request
 
 #### 障碍一：锁粒度过粗（TODO 注释明确说明）
 
-当前更新机制使用 **Page 级互斥锁** `page.mu`，见 [`internal/glance/glance.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/glance.go#L352-L358)：
+当前更新机制使用 **Page 级互斥锁** `page.mu`，见 [`internal/glance/glance.go`](internal/glance/glance.go#L352-L358)：
 
 ```go
 // handlePageContentRequest 中：
@@ -546,7 +546,7 @@ page.updateOutdatedWidgets()
 
 #### 障碍三：没有任何 Widget 重写 `handleRequest`
 
-经全代码库 grep 核对，只有 `widgetBase` 提供默认实现，定义于 [`internal/glance/widget.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget.go#L205-L207)：
+经全代码库 grep 核对，只有 `widgetBase` 提供默认实现，定义于 [`internal/glance/widget.go`](internal/glance/widget.go#L205-L207)：
 
 ```go
 func (widget *widgetBase) handleRequest(w http.ResponseWriter, r *http.Request) {
@@ -571,7 +571,7 @@ Glance 没有后台 goroutine 做定时更新。刷新完全由请求驱动：
 
 ### 6.2 三种缓存策略
 
-定义于 [`internal/glance/widget.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget.go#L141-L147)：
+定义于 [`internal/glance/widget.go`](internal/glance/widget.go#L141-L147)：
 
 | 策略 | 说明 | 示例 |
 |---|---|---|
@@ -581,7 +581,7 @@ Glance 没有后台 goroutine 做定时更新。刷新完全由请求驱动：
 
 ### 6.3 指数退避重试
 
-`scheduleEarlyUpdate()` 定义于 [`internal/glance/widget.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/widget.go#L350-L367)：
+`scheduleEarlyUpdate()` 定义于 [`internal/glance/widget.go`](internal/glance/widget.go#L350-L367)：
 
 ```go
 func (w *widgetBase) scheduleEarlyUpdate() *widgetBase {
@@ -607,7 +607,7 @@ func (w *widgetBase) scheduleEarlyUpdate() *widgetBase {
 
 ### 6.5 Singleflight 机制
 
-`Singleflight[T]` 定义于 [`internal/glance/singleflight.go`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/singleflight.go)，用于避免重复请求。多个并发调用共享一次 `fn()` 的结果。
+`Singleflight[T]` 定义于 [`internal/glance/singleflight.go`](internal/glance/singleflight.go)，用于避免重复请求。多个并发调用共享一次 `fn()` 的结果。
 
 > 注：当前代码库中 Singleflight 已定义并实现完成，但尚未被广泛用于 Widget 更新流程中。
 
@@ -615,7 +615,7 @@ func (w *widgetBase) scheduleEarlyUpdate() *widgetBase {
 
 ## 7. 前端调度边界
 
-浏览器页面加载后在 [`internal/glance/static/js/page.js`](file:///d:/fz/0601/solo-dogfeeding/code/135-glance/internal/glance/static/js/page.js#L746-L784) 执行：
+浏览器页面加载后在 [`internal/glance/static/js/page.js`](internal/glance/static/js/page.js#L746-L784) 执行：
 
 1. `fetchPageContent()` 异步拉取服务端渲染好的 HTML
 2. 注入 `#page-content`
