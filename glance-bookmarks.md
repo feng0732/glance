@@ -496,26 +496,82 @@ serveApp(configPath)
 
 > ⚠️ **常见误解**：正常分支下，`configFilesWatcher` 返回成功并不意味着「还要在 main.go 里再调一次加载」——首次加载已经在 `configFilesWatcher` 内部作为最后一步同步执行了（[config.go#436](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L436)）。`onChange(lastContents)` 被调用时 `stopServer == nil`，因此跳过 `stopServer()` 调用和 `"Config file changed, reloading..."` 日志，直接走首次启动逻辑。
 
-#### 4.8.2 watcher 内部事件处理
+#### 4.8.2 Write 事件防抖机制
 
-[configFilesWatcher](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L305-L445) 启动一个独立 goroutine 监听 fsnotify：
+[debouncedParseAndCompareBeforeCallback](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L373-L382) 是标准的**后缘重置型防抖**（resetting trailing-edge debounce），时长固定为 `debounceDuration = 500ms`：
 
-| 事件 | 处理 |
-|------|------|
-| `fsnotify.Write` | 触发 debounce（500ms，200ms 滑动窗口）→ 重新 parseYAMLIncludes → 内容比对 |
-| `fsnotify.Rename` | Linux 下 rename 后文件不再被 watch：等待最多 2 秒（10 × 200ms）轮询看文件是否重新出现，然后走完整比对 |
-| `fsnotify.Remove` | 从 includes 中移除，走完整比对 |
-| `fsnotify.Chmod` | 忽略 |
-| watcher.Errors | 传 onErr 回调输出日志，不中断服务 |
+```
+首次 Write 事件:
+  debounceTimer == nil → time.AfterFunc(500ms, parseAndCompareBeforeCallback)
 
-每次变更后 [parseAndCompareBeforeCallback](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L349-L371) 做三件事：
+后续 Write 事件（定时器尚未触发期间）:
+  debounceTimer != nil → Stop() + Reset(500ms)
+```
+
+每次新的 Write 事件到达时：
+- 若 500ms 内持续不断有 Write 事件，定时器不断被重置，`parseAndCompareBeforeCallback` 永不被触发
+- 只有当连续 500ms 内没有新的 Write 事件时，定时器才会真正到期执行
+
+> ⚠️ **常见误解**：文档原描述的「200ms 滑动窗口」并不存在——200ms 是 Rename 事件中轮询 `os.Stat` 的间隔，与防抖完全无关。防抖只有单一的 500ms 重置机制，无滑动窗口。
+
+定时器到期后执行的 [parseAndCompareBeforeCallback](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L349-L371) 做三件事：
 1. 重新 `parseYAMLIncludes` 得到 `currentContents` 与 `currentIncludes`
 2. 比对 includes set：有增删则调用 `watcher.Add / watcher.Remove` 动态更新监听列表
-3. 比对字节内容 `bytes.Equal(lastContents, currentContents)`：不同才触发 `onChange`
+3. 比对字节内容 `bytes.Equal(lastContents, currentContents)`：不同才触发 `onChange(currentContents)`
 
-所有状态操作（`lastContents`、`lastIncludes`、`debounceTimer`）受 `sync.Mutex` 保护，避免多 goroutine 竞态。
+#### 4.8.3 Rename 事件的等待逻辑与 Remove 处理
 
-#### 4.8.3 onChange 回调：旧配置保留的精确触发路径
+[watcher 事件循环](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L391-L434) 中对三种事件的精确处理：
+
+| 事件 | 处理流程 |
+|------|---------|
+| **`fsnotify.Write`** | 直接调用 `debouncedParseAndCompareBeforeCallback()`（见 4.8.2） |
+| **`fsnotify.Rename`** | ① `deleteLastInclude(event.Name)` 从 includes 中移除旧文件 <br> ② `for range 10` 轮询 `os.Stat(event.Name)`：文件一旦存在立即 `break`，否则 `Sleep(200ms)`，最多等待 2s <br> ③ 无论文件是否重现，都调用 `debouncedParseAndCompareBeforeCallback()` |
+| **`fsnotify.Remove`** | ① `deleteLastInclude(event.Name)` <br> ② 直接调用 `debouncedParseAndCompareBeforeCallback()`（不等待） |
+| `fsnotify.Chmod` | 无匹配分支，静默忽略 |
+| `watcher.Errors` | 传 `onErr` 回调输出日志，不中断服务 |
+
+Rename 轮询逻辑的设计目的（来自源码注释，参考 [fsnotify#255](https://github.com/fsnotify/fsnotify/issues/255) 与 [glance#358](https://github.com/glanceapp/glance/pull/358)）：
+- **Linux 上**：rename 后原文件路径不再被 watch；许多编辑器执行「原子写入」时的行为是 `write tmp → rename tmp → original`，短时间内原路径会消失再出现。10 × 200ms 轮询就是在等这个原子写入完成。
+- **Windows 上**：rename 后 watch 会跟随到新文件名，但事件中不提供新名字，代码无法主动 unwatch 旧名；代码按 Linux 行为处理，Windows 上可能存在多余的 watch。
+
+轮询使用的 `event.Name` 是**被重命名前的旧文件名**，轮询成功意味着同名文件已被重新创建。
+
+即使 2 秒后文件仍未出现（用户真的删除/移走了配置），防抖回调也会照常执行——`parseYAMLIncludes` 会因找不到文件报错（经 `onErr` 输出），不影响已有配置。
+
+#### 4.8.4 各变量的并发保护机制
+
+函数入口声明的唯一锁是 `mu := sync.Mutex{}`（[config.go#347](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L347)）。三个共享状态的保护情况**并不一致**：
+
+| 变量 | 被谁访问 | 是否受 `mu` 保护 | 备注 |
+|------|---------|-----------------|------|
+| **`lastIncludes`** | `parseAndCompareBeforeCallback`（读+写）<br>`deleteLastInclude`（写） | ✅ 是 | 两处都显式 `mu.Lock()` |
+| **`lastContents`** | `parseAndCompareBeforeCallback`（读+写）<br>初始参数仅由 watcher 内部使用 | ✅ 是 | 在 `parseAndCompareBeforeCallback` 内部与 `lastIncludes` 同一把锁覆盖 |
+| **`debounceTimer`** | `debouncedParseAndCompareBeforeCallback`（watcher goroutine 内：读、Stop、Reset、AfterFunc 赋值）<br>`stopWatching` 返回函数（**主 goroutine** 内：读、Stop） | ❌ 否 | 无锁，两个 goroutine 并发访问存在 data race 风险 |
+
+**两个重要细节**：
+
+1. **`onChange` 在持有锁期间被调用**（[config.go#367-369](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L367-L369)）：
+
+```go
+mu.Lock()
+defer mu.Unlock()
+...
+if !bytes.Equal(lastContents, currentContents) {
+    lastContents = currentContents
+    onChange(currentContents)   // 持有 mu 时同步执行 onChange
+}
+```
+
+`onChange` 内部会做 `newConfigFromYAML`、`newApplication`、`stopServer`（关 HTTP server）等耗时操作，意味着**整个 `onChange` 执行期间 `mu` 一直被持有**。此时若 watcher goroutine 收到 Rename/Remove 事件并调用 `deleteLastInclude`（同样要拿 `mu`），会被阻塞到 `onChange` 返回为止。这是一种粗粒度的串行化设计，副作用是 Rename 的 2 秒轮询可能被 onChange 的耗时延后。
+
+2. **`debounceTimer` 是唯一无锁变量**：访问来自两个不同 goroutine：
+   - watcher 事件 goroutine（`debouncedParseAndCompareBeforeCallback`）
+   - 主 goroutine（`defer stopWatching()` 调用返回的 cleanup 函数）
+
+代码依赖「stopWatching 只在进程退出阶段调用、此时 watcher 事件已基本停止」这一隐式假设来规避竞态，但从 Go 内存模型角度并非严格安全。
+
+#### 4.8.5 onChange 回调：旧配置保留的精确触发路径
 
 [main.go#onChange](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/main.go#L101-L146) 的完整决策树：
 
