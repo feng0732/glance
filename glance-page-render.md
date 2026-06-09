@@ -34,8 +34,9 @@ pageTemplate（page.html + document.html + footer.html）
     ├─ <script> pageData {slug, baseURL, theme}       ← JS 数据桥（条件输出slug）
     ├─ <style id="theme-style"> 内联主题 CSS          ← 当前主题样式（newApplication阶段预渲染）
     ├─ 主题选择器按钮 HTML                              ← 主题预览（newApplication阶段预渲染）
-    ├─ <div id="page-content"></div>                  ← 空容器（待内容接口填充）
-    ├─ <div class="page-loading-container">           ← Loading 图标
+    ├─ <main class="page" id="page" aria-busy="true">  ← 可见性切换的根节点（无 .content-ready）
+    │   ├─ <div class="page-content" id="page-content"></div>  ← 空容器（待内容接口填充）
+    │   └─ <div class="page-loading-container">                ← Loading 图标（flex 居中）
     └─ <script type="module" src="page.js">           ← ES Module（浏览器 defer 执行）
     │
     ▼
@@ -52,9 +53,10 @@ pageContentElement.innerHTML = pageContent
     ├─ setupPopovers(), setupClocks(), setupCalendars()...
     ├─ setupMasonries()         ← split-column 列分配（依赖 DOM 尺寸）
     └─ finally:
-        ├─ pageElement.classList.add("content-ready")   ← CSS 切换：隐藏 loading，显示内容
+        ├─ <main#page>.classList.add("content-ready")  ← CSS 切换：隐藏 loading，显示内容
+        ├─ <main#page>.setAttribute("aria-busy", "false")
         ├─ 触发 contentReadyCallbacks
-        └─ 300ms 后添加 .page-columns-transitioned      ← 启用列动画
+        └─ 300ms 后 <body>.classList.add("page-columns-transitioned")  ← 启用列动画
     ▼
 页面可交互
 ```
@@ -634,30 +636,89 @@ function afterContentReady(callback) {
 
 ### 7.6 CSS 显示切换机制：从 Loading 到 Content
 
-骨架与内容的可见性完全通过 CSS class 切换控制，无需 JS 手动操作 `display` 属性。核心规则定义在 [site.css:10-17](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/static/css/site.css#L10-L17)：
+骨架与内容的可见性完全通过 CSS class 切换控制，无需 JS 手动操作 `display` 属性。切换的根节点是 `<main class="page" id="page">`，其上的 `.content-ready` class 是唯一的状态开关。
+
+#### DOM 层级（来自 [page.html:107-114](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/templates/page.html#L107-L114)）
+
+```html
+<main class="page" id="page" aria-live="polite" aria-busy="true">
+    <h1 class="visually-hidden">Page Title</h1>
+    <div class="page-content" id="page-content"></div>          <!-- 兄弟节点 1 -->
+    <div class="page-loading-container">                         <!-- 兄弟节点 2 -->
+        <div class="visually-hidden">Loading</div>
+        <div class="loading-icon" aria-hidden="true"></div>
+    </div>
+</main>
+```
+
+关键点：`.page-content` 和 `.page-loading-container` 是 `.page` 的**直接子元素**（兄弟关系），CSS 中 `>` 子元素选择器正是利用了这一层级。
+
+#### CSS 规则逐条解读（来自 [site.css:10-17](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/static/css/site.css#L10-L17)）
+
+**规则一（复合选择器，两个独立条件共享同一个声明块）**：
 
 ```css
-/* 初始状态：内容区隐藏，loading 也隐藏（因为 .content-ready 不在祖先链上） */
 .page-content,
 .page.content-ready .page-loading-container {
     display: none;
 }
+```
 
-/* 就绪状态：内容区显示，同时 loading 容器被上面的规则隐藏 */
+这是一个**逗号分隔的复合选择器**，等价于写两条独立规则：
+
+| 选择器 | 匹配条件 | 效果 |
+|--------|---------|------|
+| `.page-content` | 任何状态下的 `.page-content` 元素 | 始终隐藏内容区（除非被更高优先级规则覆盖） |
+| `.page.content-ready .page-loading-container` | **祖先**有 `.content-ready` 时的 `.page-loading-container` | 就绪状态下隐藏 loading |
+
+注意第二个选择器使用**后代选择器**（空格，非 `>`），因为 `.page-loading-container` 本身就是 `.page` 的直接子元素，用后代或子代都能匹配；而第一个选择器没有带任何祖先限定，特异性更低，会被就绪状态的规则二覆盖。
+
+**规则二（就绪状态下显示内容）**：
+
+```css
 .page.content-ready > .page-content {
     display: block;
     animation: pageContentEntrance .3s cubic-bezier(0.25, 1, 0.5, 1) backwards;
 }
 ```
 
-**两种状态对比**：
+| 选择器 | 匹配条件 | 效果 |
+|--------|---------|------|
+| `.page.content-ready > .page-content` | 父元素**同时**有 `.page` 和 `.content-ready` 时的**直接子元素** `.page-content` | 显示内容区 + 播放入场动画 |
 
-| DOM 状态 | `.page-content` | `.page-loading-container` |
-|---------|-----------------|--------------------------|
-| 初始（无 `.content-ready`） | `display: none`（匹配第1条规则） | 默认 `display: flex`（[site.css:157-165](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/static/css/site.css#L157-L165)），显示 Loading 图标 |
-| 就绪（`.page.content-ready`） | `display: block` + 入场动画（匹配第2条规则） | `display: none`（匹配第1条规则的后半部分） |
+特异性对比：
+- 规则一：`.page-content`（1 个 class） → 特异性 `0,1,0`
+- 规则二：`.page.content-ready > .page-content`（3 个 class + 子代选择器）→ 特异性 `0,3,0`
+- 因此就绪状态下规则二优先，内容区显示。
 
-**动画延迟启用**：300ms 后才添加 `page-columns-transitioned` class（[page.js:779-781](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/static/js/page.js#L779-L781)），目的是避免首屏 masonry 布局重排触发大量列动画，影响性能感知。
+#### Loading 容器的默认样式（来自 [site.css:157-165](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/static/css/site.css#L157-L165)）
+
+```css
+.page-loading-container {
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: loadingContainerEntrance 200ms backwards;
+    animation-delay: 150ms;   /* 延迟 150ms 再显示，避免快速加载时的闪烁 */
+    font-size: 2rem;
+}
+```
+
+初始状态下（无 `.content-ready`），规则一中的 `.page.content-ready .page-loading-container` **不匹配**，因此 loading 使用此处默认的 `display: flex`（垂直水平居中显示图标）。
+
+#### 两种状态完整推演
+
+| 状态 | DOM 根节点 | `.page-content` 最终生效样式 | `.page-loading-container` 最终生效样式 |
+|------|-----------|----------------------------|---------------------------------------|
+| **初始** | `<main class="page">`（无 `.content-ready`） | 规则一 `.page-content { display: none }` → **隐藏** | 规则一不匹配；默认样式 `display: flex` → **显示**，150ms 延迟后播放入场动画 |
+| **就绪** | `<main class="page content-ready">` | 规则二覆盖规则一 `display: block` + 入场动画 → **显示** | 规则一 `.page.content-ready .page-loading-container { display: none }` 匹配 → **隐藏** |
+
+同时，JS 在添加 `.content-ready` 时同步将 `aria-busy` 从 `"true"` 改为 `"false"`（[page.js:580-581](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/static/js/page.js#L580-L581)），确保无障碍状态与视觉状态一致。
+
+#### page-columns-transitioned 的延迟启用
+
+300ms 后才向 `<body>` 添加 `page-columns-transitioned` class（[page.js:589-591](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/static/js/page.js#L589-L591)），目的是避免首屏 masonry 布局重排触发大量列动画，影响性能感知。
 
 ```css
 /* mobile.css:20-22 */
