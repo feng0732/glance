@@ -192,7 +192,31 @@ canContinueUpdateAfterHandlingErr(err)
                            └── return false       中止后续处理
 ```
 
-#### 2.2.5 两种调度策略的算法
+#### 2.2.5 两种调度策略的算法与四者调用关系
+
+`scheduleNextUpdate`、`scheduleEarlyUpdate`、`updateRetriedTimes` 和 Worker Pool 错误传播四者之间有严格的单向调用关系：
+
+```
+workerPoolDo() 返回的第三个 err
+        │
+        ▼
+canContinueUpdateAfterHandlingErr(err)
+        │
+        ├── err == nil
+        │     └── scheduleNextUpdate()
+        │           ├── nextUpdate = now + cacheDuration   （正常周期）
+        │           └── updateRetriedTimes = 0              （清零计数器）
+        │
+        └── err != nil
+              └── scheduleEarlyUpdate()
+                    ├── updateRetriedTimes++               （递增计数器，上限 5）
+                    ├── nextEarlyUpdate = now + n² 分钟
+                    └── nextUpdate = min(nextEarlyUpdate, nextUsualUpdate)
+```
+
+对 Monitor Widget 而言，由于 `workerPoolDo` 的第三个返回值恒为 nil，**调用路径永远锁定在 `err == nil → scheduleNextUpdate()` 分支**，`updateRetriedTimes` 始终为 0。
+
+---
 
 **正常调度 scheduleNextUpdate()** [widget.go#L343-L348](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget.go#L343-L348)：
 ```go
@@ -217,20 +241,27 @@ func (w *widgetBase) scheduleEarlyUpdate() *widgetBase {
 
     // 取更早的那个时间点
     if nextEarlyUpdate.After(nextUsualUpdate) {
-        w.nextUpdate = nextUsualUpdate    // 退避到 25 分钟时不会超过正常 5 分钟周期
+        w.nextUpdate = nextUsualUpdate    // 退避间隔不会超过正常缓存周期
     } else {
-        w.nextUpdate = nextEarlyUpdate    // 连续失败时：1分钟 → 4分钟 → 5分钟（被正常周期截断）
+        w.nextUpdate = nextEarlyUpdate
     }
     return w
 }
 ```
 
-对 Monitor Widget（正常周期 5 分钟）而言，实际退避序列为：
-- 第 1 次失败：1 分钟后重试
-- 第 2 次失败：4 分钟后重试
-- 第 3 次及以后：5 分钟后重试（因 9 分钟 > 正常 5 分钟，被截断）
+**`updateRetriedTimes` 计数器的生命周期**：
+- 初始零值为 `0`
+- **唯一递增点**：`scheduleEarlyUpdate()` 第一行
+- **唯一清零点**：`scheduleNextUpdate()` 第二行
+- 无其他任何地方读写此字段
+- 计数器达到 5 后不再递增，但仍会使用 5 进行退避计算（25 分钟）
 
-`updateRetriedTimes` 计数器**只在 scheduleNextUpdate() 时重置**，即只有一次完全成功的更新才能清零退避计数。
+在 5 分钟缓存周期的配置下，**如果**退避被触发（理论路径），实际序列为：
+- 第 1 次调用 `scheduleEarlyUpdate`：n=1 → 1 分钟后重试
+- 第 2 次：n=2 → 4 分钟后重试
+- 第 3 次及以后：n≥3，n² ≥ 9 分钟 > 正常 5 分钟 → 被截断为 5 分钟
+
+但对 Monitor Widget 而言，上述序列**永远不会实际发生**，因为 Worker Pool 错误传递路径决定了 `scheduleEarlyUpdate` 始终不可达。
 
 ---
 
@@ -394,18 +425,18 @@ var defaultHTTPClient = &http.Client{
 
 ### 4.4 失败场景与刷新时间因果关系矩阵
 
-| 失败场景 | siteStatus.Error | siteStatus.TimedOut | fetchStatusForSites 返回 err | 调度函数 | 下一次刷新时间 |
-|---------|------------------|---------------------|------------------------------|---------|--------------|
-| **正常 200** | nil | false | nil | scheduleNextUpdate | T + 5min |
-| **HTTP 404/500** | nil | false | nil | scheduleNextUpdate | T + 5min |
-| **单站请求超时** | context.DeadlineExceeded | true | nil | scheduleNextUpdate | T + 5min |
-| **单站 DNS 解析失败** | DNSError | false | nil | scheduleNextUpdate | T + 5min |
-| **单站 TLS 握手失败** | TLSError | false | nil | scheduleNextUpdate | T + 5min |
-| **所有站点全部超时** | 多站均为 DeadlineExceeded | 多站 true | nil | scheduleNextUpdate | T + 5min |
-| **所有站点全部挂掉** | 多站均为非 nil | 多站 false | nil | scheduleNextUpdate | T + 5min |
-| **Worker Pool context 被取消（需改源码）** | 未执行的站点为零值 | false | context.Canceled 或 DeadlineExceeded | scheduleEarlyUpdate | 1min → 4min → 5min（被正常周期截断） |
+| 失败场景 | siteStatus.Error | siteStatus.TimedOut | fetchStatusForSites 返回 err | 调度函数 | updateRetriedTimes | 下一次刷新时间 |
+|---------|------------------|---------------------|------------------------------|---------|-------------------|--------------|
+| **正常 200** | nil | false | nil | scheduleNextUpdate | 重置为 0 | T + 5min |
+| **HTTP 404/500** | nil | false | nil | scheduleNextUpdate | 重置为 0 | T + 5min |
+| **单站请求超时** | context.DeadlineExceeded | true | nil | scheduleNextUpdate | 重置为 0 | T + 5min |
+| **单站 DNS 解析失败** | DNSError | false | nil | scheduleNextUpdate | 重置为 0 | T + 5min |
+| **单站 TLS 握手失败** | TLSError | false | nil | scheduleNextUpdate | 重置为 0 | T + 5min |
+| **所有站点全部超时** | 多站均为 DeadlineExceeded | 多站 true | nil | scheduleNextUpdate | 重置为 0 | T + 5min |
+| **所有站点全部挂掉** | 多站均为非 nil | 多站 false | nil | scheduleNextUpdate | 重置为 0 | T + 5min |
+| **Worker Pool context 被取消（需改源码）** | 未执行的站点为零值 | false | context.Canceled 或 DeadlineExceeded | scheduleEarlyUpdate | 递增至 1/2/3/4/5 | 1 分钟 → 4 分钟 → 5 分钟（被正常周期截断） |
 
-**结论**：Monitor Widget 在所有正常使用场景下，下一次刷新时间恒为「当前时间 + 缓存周期（默认 5 分钟）」，与被监控站点的健康状态无关。指数退避机制仅存在于基类的理论路径中，对 Monitor 是不可达的死代码。
+**结论**：Monitor Widget 在所有正常使用场景下，下一次刷新时间恒为「当前时间 + 缓存周期（默认 5 分钟）」，`updateRetriedTimes` 每次都被重置为 0，与被监控站点的健康状态无关。指数退避机制仅存在于基类的理论路径中，对 Monitor 是不可达的死代码。
 
 ---
 
@@ -628,7 +659,7 @@ workerPoolDo(job)
     │
     ▼
 scheduleNextUpdate() 或 scheduleEarlyUpdate()
-    │
+    │   （Monitor 中恒走 scheduleNextUpdate，退避分支不可达）
     ▼
 根据 Style 渲染 monitor.html 或 monitor-compact.html
 ```
