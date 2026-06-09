@@ -9,6 +9,20 @@
 3. **前端交互层** — JavaScript 监听输入变化，识别快捷词，维护状态
 4. **跳转组装层** — 按 Enter 时根据当前状态组装最终 URL 并导航
 
+### 统一结论速览（副作用篇）
+
+在逐场景推演之前，先给出所有事件监听副作用的无矛盾结论：
+
+| 场景 | 结论 |
+|------|------|
+| 点击按钮后按 Enter 是否会触发搜索？ | ❌ **不会**。按钮可聚焦，点击的 mousedown 阶段同步触发搜索框 blur → 临时监听被立即移除 |
+| 切换到其他 input 后是否会被搜索框监听捕获？ | ❌ **不会**。其他 input 聚焦时搜索框 blur → 临时监听已移除 |
+| 点击空白区域后按 Enter 是否会触发搜索？ | ⚠️ **会，但影响极小**。不可聚焦元素不触发 blur，焦点仍在搜索框，语义上仍属搜索框上下文 |
+| 其他 input 的输入是否会污染搜索栏的 Bang 状态？ | ❌ **不会**。同上，其他 input 聚焦时监听已被移除 |
+| Popover 与搜索框同时打开按 Escape？ | ⚠️ 两个独立监听都会执行：Popover 关闭 + 搜索框失焦，叠加但不冲突 |
+| 全局 S 键在 contenteditable 中是否会抢焦点？ | ✅ **会，但 Glance 当前无此元素**。白名单仅包含 INPUT/TEXTAREA |
+| **真正需要警惕的 Bug** | ✅ `.value=""` 不触发 input 导致 Bang 状态残留；`lastQuery` 只存纯查询词不存引擎快照 |
+
 ---
 
 ## 一、快捷词解析（Bang Parsing）
@@ -466,18 +480,23 @@ if (event.key == "ArrowUp" && lastQuery.length > 0) {
 
 ---
 
-### 7.4 全局监听的副作用：哪些事件会污染状态
+### 7.4 全局监听副作用的统一梳理
 
-事件监听注册如下（[page.js](file:///d:/fz/0601/solo-dogfeeding/code/142-glance/internal/glance/static/js/page.js#L186-L201)）：
+事件监听注册代码（[page.js](file:///d:/fz/0601/solo-dogfeeding/code/142-glance/internal/glance/static/js/page.js#L186-L201)）：
 
 ```javascript
+// 第一组：受 focus/blur 控制的临时监听
 inputElement.addEventListener("focus", () => {
-    document.addEventListener("keydown", handleKeyDown);   // 挂在 document
-    document.addEventListener("input", handleInput);       // 挂在 document
+    document.addEventListener("keydown", handleKeyDown);   // A
+    document.addEventListener("input", handleInput);       // B
+});
+inputElement.addEventListener("blur", () => {
+    document.removeEventListener("keydown", handleKeyDown);
+    document.removeEventListener("input", handleInput);
 });
 
-// 这个监听器永久挂在 document，不受 focus 影响
-document.addEventListener("keydown", (event) => {
+// 第二组：永久存在的全局监听
+document.addEventListener("keydown", (event) => {          // C
     if (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
     if (event.code != "KeyS") return;
     inputElement.focus();
@@ -485,82 +504,75 @@ document.addEventListener("keydown", (event) => {
 });
 ```
 
-#### 7.4.1 永久全局 S 键监听
+**理解副作用的核心前提：** A/B 监听只在搜索框 `focus` 时存在，`blur` 时同步移除。浏览器焦点模型天然提供了第一层保护——点击可聚焦元素（button、其他 input）会在 `mousedown` 阶段触发搜索框的 `blur`，从而立即卸载 A/B。因此许多"看起来会跨元素污染"的担忧在实际浏览器行为中**不成立**。
 
-第二个 `keydown` 监听器**始终存在于 document 上**，不受 `focus`/`blur` 生命周期控制。它有两个守卫：
+下面逐一给出统一、无矛盾的结论。
+
+#### 7.4.1 永久全局 S 键监听（C）
+
+始终存在于 document 上，不受 focus/blur 控制。有两个守卫：
 
 ```javascript
 if (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
 if (event.code != "KeyS") return;
 ```
 
-- `event.code != "KeyS"`：只拦截字母 S，不区分大小写（`code` 是物理按键，不受 Shift 影响）
-- `activeElement` 守卫：当前焦点是 `<input>` 或 `<textarea>` 时放行
+| 场景 | 是否真实发生 | 说明 |
+|------|------------|------|
+| 在 `contenteditable="true"` div 中按 S | ✅ 真实 | 白名单只有 INPUT/TEXTAREA，contenteditable 不在其中。Glance 当前无此元素，但扩展可能引入 |
+| 多搜索栏实例 + 按 S | ✅ 真实 | 每个实例独立注册 C 监听，按 S 同时 focus 所有实例，最终 DOM 中最后一个获得焦点 |
+| 在其他 `<input>`/`<textarea>` 中按 S | ❌ 不发生 | 白名单正确拦截 |
 
-**边界问题：** 如果页面上还有其他可编辑元素不在 `INPUT`/`TEXTAREA` 白名单中——例如 `contenteditable="true"` 的 `<div>`（Glance 当前没有，但扩展可能引入）——在其中编辑时按 S 会被抢走焦点并跳转到搜索框。
+#### 7.4.2 focus 期间挂在 document 的 input 监听（B）
 
-另一个问题：多个搜索栏实例的情况。`setupSearchBoxes` 会为每个 `.search` 都注册一个独立的全局 S 键监听器。页面如果有两个搜索栏（虽然 UI 设计上不太可能），按一次 S 会**同时 focus 两个输入框**，结果是后者（DOM 中后出现的）获得焦点，前者被覆盖。
+`handleInput` 挂在 document 上，用 `event.target.value` 取值。
 
-#### 7.4.2 focus 期间挂在 document 的 input 监听
+| 场景 | 是否真实发生 | 说明 |
+|------|------------|------|
+| 其他 input 的输入冒泡污染当前搜索栏 Bang | ❌ 不发生 | 用户在其他 input 输入前必先点击/Tab 过去，触发搜索框 blur → B 监听被立即移除。其他 input 获得焦点时搜索栏的 handleInput 已不在 document 上 |
+| 不可聚焦元素触发 input 事件 | ⚠️ 理论上 | 极为罕见，Glance 中不存在此类元素 |
 
-`handleInput` 挂在 `document` 而不是 `inputElement` 上。`input` 事件冒泡，所以搜索框内的输入能被捕获。但在搜索框聚焦期间，**页面上任何其他 input 的输入事件也会冒泡到 document 并触发 handleInput**。
+#### 7.4.3 focus 期间挂在 document 的 keydown 监听（A）
 
-推演这个路径：
+`handleKeyDown` 挂在 document 上，无 `event.target` 守卫，Enter 分支读取 `inputElement.value`（不是 `event.target.value`）。
 
-```
-handleInput = (event) => {
-    const value = event.target.value.trim();  // event.target 是事件源
-    ...
-}
-```
+| 场景 | 是否真实发生 | 说明 |
+|------|------------|------|
+| 点击按钮后按 Enter 触发搜索 | ❌ 不发生 | 按钮可聚焦，点击的 mousedown 阶段同步触发搜索框 blur → A 监听被立即移除 |
+| 切换到其他 input 后按 Enter/ArrowUp 触发搜索 | ❌ 不发生 | 同上，其他 input 聚焦时 A 监听已移除 |
+| 点击不可聚焦元素（空白 div/svg）后按 Enter/ArrowUp | ⚠️ 真实但影响极小 | 主流浏览器点击不可聚焦元素不触发 blur，焦点仍在搜索框，A/B 监听仍在。但此时 `activeElement` 仍是搜索 input，语义上不算"别处" |
+| Popover 打开时按 Escape | ⚠️ 真实但无冲突 | Popover 和搜索框各自注册独立的 Escape 监听，都会执行：Popover 关闭 + 搜索框失焦，叠加但不冲突 |
 
-`handleInput` 使用的是 `event.target.value`，不是 `inputElement.value`。所以如果用户在搜索框聚焦的同时（比如分屏或多光标）在另一个 input 里输入，`event.target` 会是那个 input，`handleInput` 依然会去匹配 `bangsMap`，然后调用 `changeCurrentBang` 更新**当前这个搜索栏**的状态——**跨元素的状态污染**。
+#### 7.4.4 代码设计层面的隐患（当前不触发但未来有风险）
 
-不过在实际使用中，搜索框一旦 focus 就是当前活动元素，用户同时操作两个 input 的概率极低。但从代码正确性角度这是隐患。
+虽然浏览器焦点模型天然阻止了大部分跨元素污染，但代码本身仍存在设计隐患：
+1. `handleKeyDown` 读取 `inputElement.value` 而非 `event.target.value`——若未来改动焦点生命周期（例如永久挂载监听），立刻出现跨元素操作
+2. `handleInput` 读取 `event.target.value` 而非 `inputElement.value`——同样有隐患
 
-#### 7.4.3 focus 期间挂在 document 的 keydown 监听
-
-`handleKeyDown` 同样挂在 `document`，搜索框聚焦期间**整个页面的所有键盘事件**都会被它处理：
-
-```javascript
-if (event.key == "Escape") {
-    inputElement.blur();   // 任意地方按 Escape 都会让搜索框失焦
-    return;
-}
-if (event.key == "Enter") { ... }  // 在别处按 Enter 也触发搜索
-if (event.key == "ArrowUp" && lastQuery.length > 0) {
-    inputElement.value = lastQuery;  // 在别处按 ArrowUp 也改搜索框值
-    return;
-}
-```
-
-`Enter` 和 `ArrowUp` 没有检查 `event.target === inputElement`，所以搜索框聚焦期间，用户在页面上任何位置按 Enter 都会触发搜索跳转，按 ArrowUp 都会把 lastQuery 塞进搜索框。
-
-**实际影响场景：**
-- 搜索框聚焦时用鼠标点了页面上的按钮（不会 blur 搜索框，因为按钮不会抢 focus），然后按 Enter 确认——触发了搜索跳转而不是按钮点击
-- 搜索框聚焦时打开了一个非 input 的弹窗/下拉，在其中按 Escape 同时关闭弹窗和让搜索框失焦（这个其实影响不大）
-
-修复方向很明确：在 `handleKeyDown` 和 `handleInput` 开头加守卫 `if (event.target !== inputElement) return;`，或者干脆把监听直接挂在 `inputElement` 上而不是 `document`。
+修复方向：在 `handleKeyDown` 和 `handleInput` 开头加守卫 `if (event.target !== inputElement) return;`，或直接把监听挂在 `inputElement` 而非 `document` 上。
 
 ---
 
-### 7.5 边界汇总表
+### 7.5 边界汇总表（统一结论版）
 
-| 边界场景 | 状态表现 | 根因 |
-|---------|---------|------|
-| Enter 提交后再按 Enter | 跳转残留 Bang 的空搜索页 | `.value=""` 不触发 input 事件，`currentBang` 残留；空输入保护只拦截 `currentBang==null` 情况 |
-| 手动 Backspace 清空 | 状态正确重置为默认引擎 | 用户操作触发 input 事件 → `changeCurrentBang(null)` |
-| ArrowUp 恢复查询 | 引擎标记不跟随内容更新 | `.value=lastQuery` 不触发 input 事件；`lastQuery` 只存纯查询词不存引擎快照 |
-| ArrowUp 恢复 + Bang 残留 | 输入内容无快捷词但仍跳 Bang 引擎 | 输入视觉与引擎状态语义脱节 |
-| 全局 S 键 + contenteditable | 在可编辑 div 中按 S 被抢走焦点 | 白名单仅包含 INPUT/TEXTAREA |
-| 多搜索栏实例 + S 键 | 只有最后一个实例获得焦点 | 每个实例独立注册全局 S 监听，无互斥 |
-| focus 期间别处按 Enter | 意外触发搜索跳转 | `handleKeyDown` 挂在 document 且无 `event.target` 守卫 |
-| focus 期间别处按 ArrowUp | 意外恢复 lastQuery 到搜索框 | 同上 |
-| focus 期间其他 input 输入 | 可能错误触发当前搜索栏的 Bang 切换 | `handleInput` 挂在 document 且用 `event.target` 取值 |
+| 边界场景 | 状态表现 | 是否真实发生 | 根因 |
+|---------|---------|------------|------|
+| Enter 提交后再按 Enter | 跳转残留 Bang 的空搜索页 | ✅ 真实 | `.value=""` 不触发 input 事件，`currentBang` 残留；空输入保护只拦截 `currentBang==null` 情况 |
+| 手动 Backspace 清空 | 状态正确重置为默认引擎 | ✅ 真实 | 用户操作触发 input 事件 → `changeCurrentBang(null)` |
+| ArrowUp 恢复查询 | 引擎标记不跟随内容更新 | ✅ 真实 | `.value=lastQuery` 不触发 input 事件；`lastQuery` 只存纯查询词不存引擎快照 |
+| ArrowUp 恢复 + Bang 残留 | 输入内容无快捷词但仍跳 Bang 引擎 | ✅ 真实 | 输入视觉与引擎状态语义脱节 |
+| 全局 S 键 + contenteditable | 在可编辑 div 中按 S 被抢走焦点 | ✅ 真实（Glance 当前无此元素） | 白名单仅包含 INPUT/TEXTAREA |
+| 多搜索栏实例 + S 键 | 只有最后一个实例获得焦点 | ✅ 真实 | 每个实例独立注册全局 S 监听，无互斥 |
+| 点击按钮后按 Enter 触发搜索跳转 | — | ❌ 不发生 | 按钮可聚焦，mousedown 触发 blur，A 监听已被移除 |
+| 其他 input 输入冒泡污染 Bang 状态 | — | ❌ 不发生 | 其他 input 聚焦时搜索框 blur，B 监听已被移除 |
+| 点击不可聚焦元素后按 Enter/ArrowUp | 意外触发搜索/恢复 | ⚠️ 真实但影响极小 | 不可聚焦元素不触发 blur，焦点仍在搜索框，语义上仍属搜索框上下文 |
+| Popover + 搜索框同时按 Escape | Popover 关闭 + 搜索框失焦 | ⚠️ 真实但无冲突 | 两个独立监听各自执行，叠加但不冲突 |
 
 ---
 
 ## 八、输入框事件生命周期详解
+
+> **说明：** 第七章 7.4 已给出副作用的统一结论。本章通过逐场景的事件序列推演验证这些结论，并提供完整的生命周期状态图。
 
 ### 8.1 全局监听的挂载/卸载时机
 
@@ -666,7 +678,7 @@ Group Widget 的标题按钮（[group.html](file:///d:/fz/0601/solo-dogfeeding/c
 | 3 | `focus` 触发（button） | button | ❌ 已移除 | — |
 | 4 | 用户在 button 上按 Enter | button | ❌ 已移除 | 只触发 button 默认行为，**不会触发搜索跳转** |
 
-**结论：第七章中"点击按钮后按 Enter 触发搜索"的担忧是不成立的。** 因为按钮点击在 mousedown 阶段就同步触发了搜索框的 blur，A/B 监听被立即移除，后续 Enter 键不再被 handleKeyDown 捕获。
+**结论（与第七章一致）：此场景不会发生。** 因为按钮点击在 mousedown 阶段就同步触发了搜索框的 blur，A/B 监听被立即移除，后续 Enter 键不再被 handleKeyDown 捕获。
 
 #### 8.3.2 场景：聚焦状态下切换到其他 input（如移动端导航 radio）
 
@@ -684,7 +696,7 @@ Group Widget 的标题按钮（[group.html](file:///d:/fz/0601/solo-dogfeeding/c
 
 **额外验证 C 监听（永久 S 键）：** radio 聚焦时 `activeElement.tagName === "INPUT"`，被白名单拦截，S 键不会抢焦点。
 
-**结论：第七章中"其他 input 的输入冒泡到 document 触发 handleInput"的担忧也是不成立的。** 因为其他 input 获得焦点的瞬间，搜索 input 已经 blur，A/B 监听已经被 removeEventListener 卸载，根本不会收到事件。
+**结论（与第七章一致）：此场景不会发生。** 因为其他 input 获得焦点的瞬间，搜索 input 已经 blur，A/B 监听已经被 removeEventListener 卸载，根本不会收到事件。
 
 #### 8.3.3 场景：聚焦状态下点击搜索栏内部的 `<kbd>S</kbd>` 标签
 
@@ -735,9 +747,7 @@ Glance 页面的大部分装饰性元素（svg 图标、div 容器、widget 标�
 | 1 | 点击空白 div | 搜索 input（不变） | ✅ 存在 | — |
 | 2 | 按 Enter | 搜索 input | ✅ 存在 | handleKeyDown 捕获 → **执行搜索跳转** |
 
-**结论：第七章中"点击页面其他位置后按 Enter 触发搜索"在主流浏览器中**只对不可聚焦元素成立**。这确实是真实的副作用——用户点了一下页面空白处想"取消"，焦点没丢，随手按 Enter 反而触发了搜索。
-
-但也要注意：这种情况下 `document.activeElement` 仍然是搜索 input，所以从语义上讲用户仍然在搜索框的上下文中，行为不算严重违反直觉。
+**结论（与第七章一致）：此场景真实但影响极小。** 主流浏览器点击不可聚焦元素不触发 blur，焦点仍在搜索框，按 Enter 会执行搜索。但此时 `document.activeElement` 仍然是搜索 input，从语义上讲用户仍在搜索框上下文中，不算严重违反直觉。
 
 #### 8.3.5 场景：聚焦状态下按 Escape 主动失焦
 
@@ -779,32 +789,11 @@ Popover 显示时也会向 document 添加一个**独立的** Escape keydown 监
 | 初始 | 搜索 input | 搜索框的 handleKeyDown（A） | 搜索框 blur，A/B 被移除 |
 | Popover 打开 | 搜索 input（mouseenter 不改变焦点） | A + Popover 的 handleHidePopoverOnEscape | **两个监听都会执行**：Popover 关闭 + 搜索框 blur |
 
-**结论：** 搜索框聚焦 + Popover 打开时按 Escape，两个监听都会被触发，Popover 关闭同时搜索框失焦。这是两个独立模块各自向 document 注册监听的叠加效果，但在实际使用中影响很小。
+**结论（与第七章一致）：真实但无冲突。** 搜索框聚焦 + Popover 打开时按 Escape，两个监听都会被触发，Popover 关闭同时搜索框失焦。这是两个独立模块各自向 document 注册监听的叠加效果，但在实际使用中影响很小。
 
 ---
 
-### 8.4 哪些副作用只是"表面担忧"
-
-基于上面的推演，现在可以纠正第七章中过度估计的风险：
-
-| 第七章中的担忧 | 是否真实存在 | 原因 |
-|---------------|------------|------|
-| "点击按钮后按 Enter 触发搜索跳转" | ❌ 不成立 | 按钮可聚焦，点击的 mousedown 阶段同步触发搜索框 blur → A/B 监听被立即移除 |
-| "其他 input 的输入冒泡触发 handleInput" | ❌ 不成立 | 其他 input 获得焦点的同时搜索框 blur → A/B 监听被移除，不会收到后续事件 |
-| "focus 期间别处按 Enter 意外触发搜索" | ⚠️ 仅限不可聚焦元素 | 只有点击了**不可聚焦**的空白区域/装饰元素后，焦点仍在搜索框，按 Enter 才会触发；点击按钮/其他 input 不会 |
-| "focus 期间别处按 ArrowUp 意外恢复" | ⚠️ 同上 | 同上，只有焦点仍在搜索框时才会发生，而此时 activeElement 就是搜索 input，语义上不算"别处" |
-| "全局 S 键在 contenteditable 中抢焦点" | ✅ 真实存在，但 Glance 无此场景 | 代码只白名单了 INPUT/TEXTAREA，扩展如果引入 contenteditable 会踩坑 |
-| "Popover 的 Escape 与搜索框 Escape 冲突" | ⚠️ 叠加但不冲突 | 两个监听都会执行，只是同时关闭 Popover + 搜索框失焦，无报错 |
-
-**真正需要警惕的只有两个：**
-1. **JS 赋值 `.value` 不触发 input 事件导致的状态残留**（第七章 7.1/7.2/7.3）——这是纯逻辑 bug，与浏览器焦点无关
-2. **`lastQuery` 只存纯查询词不存引擎快照**——也是纯逻辑问题
-
-其余"跨元素副作用"大部分因为浏览器焦点模型的天然保护（点击可聚焦元素会触发 blur，从而移除监听）而不会实际发生。
-
----
-
-### 8.5 完整生命周期状态图
+### 8.4 完整生命周期状态图
 
 ```
 页面加载 setupSearchBoxes()
