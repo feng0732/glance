@@ -103,24 +103,40 @@ type customIconField struct {
 "auto-invert <任意格式>"  →  AutoInvert = true，剥离前缀后继续解析
 ```
 
-**Step 2 — 按 `:` 拆分前缀与图标名**：
+**Step 2 — 按**首个 `:` **拆分前缀与剩余部分**（`strings.Cut` 只切第一个冒号）：
+
 ```
-si:github       → prefix="si", icon="github"
-di:jellyfin.png → prefix="di", icon="jellyfin.png"
-https://...     → 无冒号，整串作为 URL 直出
+si:github                          → prefix="si",  icon="github"
+di:jellyfin.png                    → prefix="di",  icon="jellyfin.png"
+/assets/my-icon.png                → 无冒号 (!found)，整串作为 URL 直接返回
+https://cdn.example.com/icon.svg   → prefix="https", icon="//cdn.example.com/icon.svg"
 ```
 
-**Step 3 — 扩展名识别**（默认 `svg`，仅支持 `svg/png`）：
+> ⚠️ **注意与常见误解的差异**：`https://...` 这样的完整 URL 是**含冒号**的，不会走 `!found` 的早返回路径，而是继续执行 Step 3 和 Step 4，最终在 Step 4 的 `switch` 的 `default` 分支才回退到原始值。
+
+**Step 3 — 扩展名识别**（从冒号后的剩余部分解析，默认 `svg`，白名单仅 `svg/png`，非法扩展名回退到 `svg`）：
+
+此步仅对 `si:` / `di:` / `mdi:` / `sh:` 等短前缀格式有意义；对于 `https://...` 这类完整 URL，Step 3 解析出的 basename/ext 是垃圾值（如从 `"//cdn.example.com/icon.svg"` 切出 `"//cdn"` / `"example"`），但不会被使用（见 Step 4 default 分支）。
 
 **Step 4 — 前缀映射到 CDN**：
 
-| 前缀 | 图标库 | CDN 路径 | 自动 AutoInvert |
-|------|--------|----------|----------------|
-| `si` | Simple Icons | `cdn.jsdelivr.net/npm/simple-icons@latest/icons/{name}.svg` | ✅ |
-| `di` | Dashboard Icons | `cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/{ext}/{name}.{ext}` | ❌ |
-| `mdi` | Material Design Icons | `cdn.jsdelivr.net/npm/@mdi/svg@latest/svg/{name}.svg` | ✅ |
-| `sh` | selfh.st Icons | `cdn.jsdelivr.net/gh/selfhst/icons/{ext}/{name}.{ext}` | ❌ |
-| 其它 | 原样 URL | 直接使用输入值 | 视 `auto-invert` 前缀 |
+| prefix | 图标库 | 结果 | 自动 AutoInvert |
+|--------|--------|------|----------------|
+| `si` | Simple Icons | 拼接 CDN URL，忽略 Step 3 结果（强制 svg） | ✅ |
+| `di` | Dashboard Icons | 用 Step 3 的 basename/ext 拼接 CDN | ❌ |
+| `mdi` | Material Design Icons | 拼接 CDN URL，忽略 Step 3 结果（强制 svg） | ✅ |
+| `sh` | selfh.st Icons | 用 Step 3 的 basename/ext 拼接 CDN | ❌ |
+| `https` / `http` / 任意其它 | 非内置前缀 | `default` 分支：**原样回退到输入原始值** | 视 `auto-invert` 前缀而定（si/mdi 以外不会自动开启） |
+
+**两种最终直出路径的对比**：
+
+| 输入示例 | 走哪条路径 | 为何正确 |
+|----------|-----------|---------|
+| `/assets/icon.svg` | `!found` 早返回（Step 2） | 本地路径不含冒号 |
+| `./icon.png` | `!found` 早返回（Step 2） | 相对路径不含冒号 |
+| `https://a.com/x.svg` | `default` 分支回退（Step 4） | 含冒号但前缀不匹配任何内置库 |
+| `ftp://a.com/x.svg` | `default` 分支回退（Step 4） | 同上 |
+| `auto-invert https://a.com/x.svg` | `default` 分支回退 + AutoInvert=true | 先剥 auto-invert 前缀，再走同上路径 |
 
 ### 2.3 模板渲染与条件显示
 
@@ -247,24 +263,27 @@ https://...     → 无冒号，整串作为 URL 直出
     │  • secret: 读 /run/secrets/<name>
     │  • readFileFromEnv: 读环境变量指向的文件内容
     │
-    ▼  yaml.Unmarshal → config 结构体
+    ▼  yaml.Unmarshal → config 结构体   [config.go#103]
+    │     └─ 内部触发 widgets.UnmarshalYAML()   [widget.go#95-124]
+    │           ├─ ① 仅解码 type 字段到临时 struct
+    │           ├─ ② newWidget("bookmarks") → &bookmarksWidget{}
+    │           └─ ③ node.Decode(widget)
+    │                 完整解码节点，触发自定义 UnmarshalYAML
+    │                 (customIconField, hslColorField, *bool 指针等)
     │
-    ├─ isConfigStateValid() 校验
+    ▼  isConfigStateValid() 逻辑校验   [config.go#108-110]
+    │     （页面、列、分组等结构层面的一致性检查）
     │
-    ├─ Pages[].HeadWidgets[]
-    │       └─ widgets.UnmarshalYAML()
-    │
-    └─ Pages[].Columns[].Widgets[]
-            └─ widgets.UnmarshalYAML()   [widget.go#95-124]
-                    │
-                    ▼
-            1. 只解码 type 字段
-            2. newWidget("bookmarks") → &bookmarksWidget{}  [widget.go#36-37]
-            3. node.Decode(widget) 完整解码节点（含自定义 UnmarshalYAML）
-            4. widget.initialize()   [widget-bookmarks.go#37-73]
-               - 属性继承计算 (SameTab/HideArrow/Target)
-               - renderTemplate() 缓存 HTML
+    ▼  显式 for 循环调用 initialize()   [config.go#112-126]
+          ├─ 遍历 Pages[].HeadWidgets[]
+          │     └─ widget.initialize()
+          │           · bookmarks: 属性继承计算 (SameTab/HideArrow/Target)
+          │           · bookmarks: renderTemplate() 缓存 HTML
+          └─ 遍历 Pages[].Columns[].Widgets[]
+                └─ widget.initialize()
 ```
+
+> ⚠️ **顺序关键差异**：`widgets.UnmarshalYAML`（步骤①②③）完全发生在 `yaml.Unmarshal` 内部；而 `initialize()` 是 `yaml.Unmarshal` 结束、`isConfigStateValid` 通过之后才**单独**执行的显式循环。两者不在同一阶段，这也解释了为什么 `initialize` 中可以访问已完整反序列化的所有字段——包括依赖自定义 UnmarshalYAML 的 `SameTabRaw` 指针、`customIconField.URL` 等。
 
 ---
 
@@ -447,61 +466,116 @@ icon: https://example.com/icon.svg    # 任意远程 URL
 
 ### 4.8 配置变更热重载与旧配置保留
 
-#### 4.8.1 文件监听启动
+#### 4.8.1 双入口：首次加载走哪条路径
 
-入口在 [main.go#152-177](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/main.go#L152-L177)：
+[serveApp](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/main.go#L93-L181) 的整体结构决定了首次加载有**两条互斥入口**，取决于 `configFilesWatcher` 是否启动成功：
 
-```go
-configContents, configIncludes, err := parseYAMLIncludes(configPath)
-stopWatching, err := configFilesWatcher(configPath, configContents, configIncludes, onChange, onErr)
+```
+serveApp(configPath)
+│
+├─ ① parseYAMLIncludes(configPath)      // 仅做一次，拿到初始 contents/includes
+│
+├─ ② configFilesWatcher(configPath, contents, includes, onChange, onErr)
+│      │
+│      ├─ err == nil  → [ 正常分支 ]
+│      │     ├─ defer stopWatching()       // 注册进程退出时关闭 watcher
+│      │     └─ 首次加载入口：
+│      │           configFilesWatcher 函数末尾 [config.go#436]
+│      │           无条件执行 onChange(lastContents)
+│      │           （此时 stopServer == nil，不打印"reloading"日志，直接启动 server）
+│      │
+│      └─ err != nil  → [ Fallback 分支 ]
+│            ├─ 日志输出 watcher 启动失败
+│            └─ 首次加载入口：
+│                  main.go#L163-L177 显式调用
+│                  newConfigFromYAML → newApplication → app.server() → startServer()
+│                  （不经过 onChange 回调，hadValidConfigOnStartup 永远保持 false）
+│
+└─ ③ <-exitChannel  // 阻塞等待退出信号
 ```
 
-若 watcher 启动失败（如某些平台不支持 fsnotify），降级为单次加载并启动服务，不再监听变更。
+> ⚠️ **常见误解**：正常分支下，`configFilesWatcher` 返回成功并不意味着「还要在 main.go 里再调一次加载」——首次加载已经在 `configFilesWatcher` 内部作为最后一步同步执行了（[config.go#436](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L436)）。`onChange(lastContents)` 被调用时 `stopServer == nil`，因此跳过 `stopServer()` 调用和 `"Config file changed, reloading..."` 日志，直接走首次启动逻辑。
 
-#### 4.8.2 watcher 内部逻辑
+#### 4.8.2 watcher 内部事件处理
 
-[configFilesWatcher](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L305-L445) 的核心行为：
+[configFilesWatcher](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L305-L445) 启动一个独立 goroutine 监听 fsnotify：
 
 | 事件 | 处理 |
 |------|------|
-| `fsnotify.Write` | 触发 debounce（500ms）→ 重新 parseYAMLIncludes → 内容比对 |
-| `fsnotify.Rename` | Linux 下重命名后文件不再被 watch：等待最多 2 秒（10 × 200ms）看文件是否重新出现，然后走完整比对 |
+| `fsnotify.Write` | 触发 debounce（500ms，200ms 滑动窗口）→ 重新 parseYAMLIncludes → 内容比对 |
+| `fsnotify.Rename` | Linux 下 rename 后文件不再被 watch：等待最多 2 秒（10 × 200ms）轮询看文件是否重新出现，然后走完整比对 |
 | `fsnotify.Remove` | 从 includes 中移除，走完整比对 |
+| `fsnotify.Chmod` | 忽略 |
+| watcher.Errors | 传 onErr 回调输出日志，不中断服务 |
 
 每次变更后 [parseAndCompareBeforeCallback](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/config.go#L349-L371) 做三件事：
 1. 重新 `parseYAMLIncludes` 得到 `currentContents` 与 `currentIncludes`
 2. 比对 includes set：有增删则调用 `watcher.Add / watcher.Remove` 动态更新监听列表
 3. 比对字节内容 `bytes.Equal(lastContents, currentContents)`：不同才触发 `onChange`
 
-所有状态操作（`lastContents`、`lastIncludes`）受 `sync.Mutex` 保护，避免多 goroutine 竞态。
+所有状态操作（`lastContents`、`lastIncludes`、`debounceTimer`）受 `sync.Mutex` 保护，避免多 goroutine 竞态。
 
-#### 4.8.3 onChange 回调：旧配置保留机制
+#### 4.8.3 onChange 回调：旧配置保留的精确触发路径
 
-[main.go#onChange](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/main.go#L101-L146) 是旧配置保留的核心：
+[main.go#onChange](file:///d:/fz/0601/solo-dogfeeding/code/143-glance/internal/glance/main.go#L101-L146) 的完整决策树：
 
 ```
 onChange(newContents []byte)
 │
-├─ newConfigFromYAML(newContents)
-│     ├─ 成功 → 继续
-│     └─ 失败（parseConfigVariables / yaml.Unmarshal / 校验 / initialize 任一环节报错）
-│           ├─ hadValidConfigOnStartup == false → close(exitChannel) 进程退出
-│           └─ hadValidConfigOnStartup == true  →  【关键】return，不做任何替换
-│                                                    旧 app / 旧 server 毫发无损继续运行
+│  入口判断：
+│  stopServer != nil ? ──是──→ 打印 "Config file changed, reloading..."
+│       │否
+│       └──── （首次加载，不打印任何 reload 日志）
 │
-├─ newApplication(config)
-│     ├─ 成功 → 继续
-│     └─ 失败 → 同上：首次启动才退出，否则 return 保留旧配置
+├─ [失败点 A] newConfigFromYAML(newContents)
+│     │                                   ↑
+│     │成功                               │  parseConfigVariables 变量替换失败
+│     │                                   │  yaml.Unmarshal 反序列化失败
+│     │                                   │  isConfigStateValid 结构校验失败
+│     │                                   │  任一 widget.initialize() 失败
+│     │
+│     └─ 失败 → 日志 "Config has errors: %v"
+│              │
+│              ├─ hadValidConfigOnStartup == false
+│              │   └─ close(exitChannel) → 进程退出（无旧配置可保留）
+│              │
+│              └─ hadValidConfigOnStartup == true
+│                  └─ return   ◀── 【旧配置保留触发点 ①】
+│                              不执行后续任何代码，旧 app/server 完好
 │
-├─ hadValidConfigOnStartup = true   // 标记已有有效配置
+├─ [失败点 B] newApplication(config)
+│     │
+│     └─ 失败 → 日志 "Failed to create application: %v"
+│              同上分支：首次失败退出，非首次 return
+│                       ◀── 【旧配置保留触发点 ②】
 │
-└─ stopServer()      // 停掉旧 HTTP server
-    new app.server() // 启动新 server（替换 stopServer 闭包）
+├─ hadValidConfigOnStartup = true   ←  A、B 都通过后才置位
+│
+├─ stopServer != nil ? ──是──→ stopServer()   // 停旧 HTTP server（可能 err，仅日志）
+│       │否
+│       └──── （首次加载，无需停旧 server）
+│
+└─ go func() {
+       startServer, stopServer = app.server()   // 替换闭包
+       startServer()  // 启动新 server，失败仅日志
+   }()
 ```
 
-**结论**：只要进程曾经成功启动过一次（`hadValidConfigOnStartup=true`），之后任何配置变更导致的解析错误、校验错误、初始化错误都只会在日志中输出 `Config has errors: ...`，**旧的 application 与 HTTP server 完全不受影响**，直到用户修复配置并保存后才会触发下一次成功替换。
+**旧配置保留的精确触发条件**（需同时满足）：
 
-初次启动时若配置无效则直接退出（无旧配置可保留），这是 `!hadValidConfigOnStartup` 分支的唯一用途。
+1. 进程历史上**至少有一次** A + B 全部通过（`hadValidConfigOnStartup == true`）
+2. 本次变更后 A 或 B **任一失败**
+3. **不会**触发 `stopServer()`，也不会触碰 `app` 和 `stopServer` 闭包变量
+4. 旧 server 在原有的 goroutine 中继续监听原端口，完全不受影响
+
+**不会触发保留、直接退出的情形**：
+
+- 进程首次启动（`hadValidConfigOnStartup == false`）且 A 或 B 失败
+- 这只会发生在正常分支的首次 `onChange(lastContents)` 调用期间，因为一旦成功过一次 flag 就会被置 true
+
+**Fallback 分支的特殊情况**：
+
+watcher 启动失败走 Fallback 时，代码不经过 `onChange`，所以 `hadValidConfigOnStartup` 永远保持 `false`。但此时也不存在后续的 reload 调用机会，保留机制自然不会被触发——配置失败时直接 `return fmt.Errorf(...)` 退出进程。
 
 ---
 
