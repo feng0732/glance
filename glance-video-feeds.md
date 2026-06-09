@@ -1,6 +1,6 @@
 # Glance 视频源聚合拉取路径全解析
 
-本文档顺着代码调用链，讲清频道识别、元数据组装、封面缓存、直播状态预留，以及纵向列表的独立渲染分支、抓取失败后的重试机制、发布时间解析失败对排序的影响、直播状态接入与刷新频率/排序/展示样式的关联。
+本文档顺着代码调用链，讲清频道识别、元数据组装、封面缓存、纵向列表的独立渲染分支、抓取失败后的重试机制、发布时间解析失败对排序的影响，以及直播状态接入与刷新频率/排序/展示样式/重试机制的关联。
 
 ---
 
@@ -295,48 +295,137 @@ func (widget *videosWidget) Render() template.HTML {
 
 ---
 
-## 五、抓取失败后的重试机制
+## 五、抓取失败与重试：notice/error 状态机与内容保留
 
-重试逻辑不在 Videos widget 自身，而是继承自 `widgetBase`，通过 `canContinueUpdateAfterHandlingErr()` + `scheduleEarlyUpdate()` 两段组合实现。
+重试机制不是孤立的"等 N 分钟再试"，而是由 `withError` → `withNotice` → `canContinueUpdateAfterHandlingErr` → `scheduleEarlyUpdate` / `scheduleNextUpdate` 四段代码共同组成的状态机，直接决定了 UI 上显示什么、是否保留旧内容、以及下次什么时候刷新。
 
-### 5.1 错误分级与调度入口
+### 5.1 三个关键标志位
 
-[widgetBase.canContinueUpdateAfterHandlingErr()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget.go#L293-L325)：
+[widgetBase 结构体](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget.go#L149-L167) 中有三个字段决定一切：
+
+```go
+type widgetBase struct {
+    ContentAvailable    bool   // 是否展示过成功内容
+    Error               error  // 严重错误
+    Notice              error  // 轻微提示
+    nextUpdate          time.Time // 下次允许刷新的时间点
+    updateRetriedTimes  int    // 连续失败次数
+    // ...
+}
+```
+
+三者的语义绑定：
+- `ContentAvailable == false`：从未成功过，渲染时显示全屏 ERROR 面板
+- `ContentAvailable == true && Error != nil`：曾成功过，现在有严重错误，渲染内容+右上角红色 major 图标
+- `ContentAvailable == true && Notice != nil`：曾成功过，现在有轻微提示，渲染内容+右上角黄色 minor 图标
+- `ContentAvailable == true && Error == nil && Notice == nil`：一切正常，渲染干净的内容
+
+### 5.2 withError 的隐含副作用：首次成功解锁 ContentAvailable
+
+[withError()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget.go#L283-L291) 是整个状态机的关键开关：
+
+```go
+func (w *widgetBase) withError(err error) *widgetBase {
+    if err == nil && !w.ContentAvailable {
+        w.ContentAvailable = true   // 第一次无错误调用 → 永久解锁
+    }
+    w.Error = err
+    return w
+}
+```
+
+`ContentAvailable` 是**单向锁**：一旦被设为 `true`，代码中没有任何路径能把它重新设回 `false`（除了 `renderTemplate()` 在模板渲染失败时会设为 false，但这跟网络请求无关）。意味着：
+
+- 首次加载失败 → `ContentAvailable` 仍为 false → 显示全屏 ERROR
+- 哪怕只有一次成功 → `ContentAvailable = true` → 之后再失败也不会回到全屏 ERROR，只会在内容上方显示红色图标并保留上次的旧数据
+
+这是一个"渐强可信度"设计：widget 只要成功过一次，用户就永远不会再看到空 ERROR 页，最差情况是看到稍旧的数据。
+
+### 5.3 canContinueUpdateAfterHandlingErr 的完整分支
+
+[canContinueUpdateAfterHandlingErr()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget.go#L293-L325) 是 Videos widget 的 `update()` 中唯一的出口判断：
 
 ```go
 func (w *widgetBase) canContinueUpdateAfterHandlingErr(err error) bool {
     if err != nil {
-        w.scheduleEarlyUpdate()          // 只要有错误，一定走早重试
+        w.scheduleEarlyUpdate()           // 任何错误都触发指数退避重试
 
         if !errors.Is(err, errPartialContent) {
-            w.withError(err)             // 严重错误：显示红色 ERROR 面板
+            // 分支 1：严重错误（全部失败）
+            w.withError(err)              // Error = err，Notice = nil
             w.withNotice(nil)
-            return false                 // 不保留旧数据
+            return false                  // ⚠ 返回 false → widget.Videos 不会被赋值
         }
 
-        w.withError(nil)
-        w.withNotice(err)                // 部分错误：右上角黄色小图标
-        return true                      // 保留已拿到的部分数据
+        // 分支 2：部分错误（只挂了部分频道）
+        w.withError(nil)                  // Error = nil；若首次成功则解锁 ContentAvailable
+        w.withNotice(err)                 // Notice = err
+        return true                       // ✓ 返回 true → widget.Videos 会被赋值
+
     }
 
+    // 分支 3：完全成功
     w.withNotice(nil)
-    w.withError(nil)
-    w.scheduleNextUpdate()              // 无错误：按正常间隔排期
+    w.withError(nil)                      // Error = nil；若首次成功则解锁 ContentAvailable
+    w.scheduleNextUpdate()                // 重试计数归零，正常排期
     return true
 }
 ```
 
-对应 Videos widget 的两种失败场景：
+把三个分支和 `update()` 的后续代码拼起来看：
 
-| 场景 | fetchYoutubeChannelUploads 返回值 | 行为 |
-|------|----------------------------------|------|
-| 全部频道请求失败 | `errNoContent` | 显示 ERROR 面板，下次按指数退避早重试 |
-| 部分频道请求失败 | `errPartialContent` + 已有视频 | 右上角黄色感叹号，展示成功的视频，同时早重试 |
-| 全部成功 | `nil` | 正常排 1 小时后的下一次刷新 |
+```go
+// videosWidget.update()
+videos, err := fetchYoutubeChannelUploads(...)
 
-`withError` / `withNotice` 的 UI 表现见 [widget-base.html](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/templates/widget-base.html#L21-L25)：严重错误会把整个 widget 内容替换成 ERROR 卡片，轻微错误只是 header 上出现 `notice-icon-minor` 小圆点，鼠标悬停显示错误文字。
+if !widget.canContinueUpdateAfterHandlingErr(err) {
+    return   // 严重错误时直接 return，Videos 不更新
+}
 
-### 5.2 指数退避的早重试
+// 只有 return true 才会走到下面
+if len(videos) > widget.Limit {
+    videos = videos[:widget.Limit]
+}
+widget.Videos = videos   // 用新数据覆盖旧数据
+```
+
+因此三种情况下的完整状态变化是：
+
+| 场景 | ContentAvailable 之前 | ContentAvailable 之后 | Error | Notice | 数据是否更新 | UI 表现 |
+|------|----------------------|----------------------|-------|--------|------------|---------|
+| **首次加载全挂** | false | false | errNoContent | nil | ❌ 不更新（保留空数组） | 全屏红色 ERROR 面板 |
+| **后续全挂（曾成功过）** | true | true | errNoContent | nil | ❌ 不更新（保留旧 Videos） | 旧内容 + 右上角红色 major 图标，title 显示错误信息 |
+| **部分失败** | false/true | true | nil | errPartialContent | ✅ 用拿到的部分数据覆盖 | 内容 + 右上角黄色 minor 图标 |
+| **全部成功** | false/true | true | nil | nil | ✅ 新数据覆盖 | 干净内容，无图标 |
+
+关键点：**严重错误时 `update()` 在赋值 `widget.Videos` 之前就 return 了**，所以旧数据得以保留（如果之前有的话）。这是 Glance 的 "graceful degradation" 策略：宁旧勿空。
+
+### 5.4 更新触发节奏：只有 HTTP 请求才会驱动刷新
+
+整个项目**没有后台定时 goroutine** 主动刷新 widget。更新链路完全由 HTTP 请求驱动：
+
+1. 浏览器加载页面 → `setupPage()` 调用 `fetchPageContent()`（[page.js L746-L784](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/static/js/page.js#L746-L784)）
+2. 请求打到 `/api/pages/{page}/content/` → [handlePageContentRequest()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/glance.go#L334-L367)
+3. 该 handler 先拿 `page.mu` 互斥锁 → 调用 [updateOutdatedWidgets()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/glance.go#L233-L270)
+4. `updateOutdatedWidgets()` 遍历所有 widget，调 [requiresUpdate()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget.go#L173-L183) 判断：
+
+```go
+func (w *widgetBase) requiresUpdate(now *time.Time) bool {
+    if w.cacheType == cacheTypeInfinite {
+        return false
+    }
+    if w.nextUpdate.IsZero() {
+        return true   // 从未刷新过 → 一定刷
+    }
+    return now.After(w.nextUpdate)   // 到了 nextUpdate 时间点才刷
+}
+```
+
+5. 需要刷新的 widget 被并发 goroutine 执行 `widget.update(ctx)`，`wg.Wait()` 等全部完成才释放锁、渲染模板、返回响应。
+
+**前端 JS 也不会周期轮询**：`setupDynamicRelativeTime()` 每 60 秒只刷新"5 分钟前"这样的相对时间文本，不重新拉 `/api/pages/.../content/`。也就是说如果用户把页面开着挂 8 小时不手动刷新，widget 数据就是 8 小时前的快照。
+
+### 5.5 scheduleEarlyUpdate 指数退避的细节
 
 [scheduleEarlyUpdate()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget.go#L350-L367)：
 
@@ -344,14 +433,14 @@ func (w *widgetBase) canContinueUpdateAfterHandlingErr(err error) bool {
 func (w *widgetBase) scheduleEarlyUpdate() *widgetBase {
     w.updateRetriedTimes++
     if w.updateRetriedTimes > 5 {
-        w.updateRetriedTimes = 5       // 最大退避次数封顶
+        w.updateRetriedTimes = 5       // 最大 5 次，封顶
     }
 
-    // 第 n 次失败，等 n² 分钟后再试
-    nextEarlyUpdate := time.Now().Add(time.Duration(math.Pow(float64(w.updateRetriedTimes), 2)) * time.Minute)
+    nextEarlyUpdate := time.Now().Add(
+        time.Duration(math.Pow(float64(w.updateRetriedTimes), 2)) * time.Minute)
     nextUsualUpdate := w.getNextUpdateTime()
 
-    // 取较早的那个，防止退避时间超过正常刷新周期
+    // 取两者中更早的那个
     if nextEarlyUpdate.After(nextUsualUpdate) {
         w.nextUpdate = nextUsualUpdate
     } else {
@@ -361,22 +450,39 @@ func (w *widgetBase) scheduleEarlyUpdate() *widgetBase {
 }
 ```
 
-退避时间表（Videos widget 正常周期 1h）：
+Videos widget 正常周期 1 小时，所以实际退避时间表是：
 
-| 失败次数 | 早重试间隔 | 实际下次刷新 |
-|---------|-----------|-------------|
-| 1 | 1 分钟后 | 1 分钟后 |
-| 2 | 4 分钟后 | 4 分钟后 |
-| 3 | 9 分钟后 | 9 分钟后 |
-| 4 | 16 分钟后 | 16 分钟后 |
-| 5 | 25 分钟后 | 25 分钟后 |
-| 6+ | 仍按 25 分钟 | 25 分钟后封顶 |
+| 连续失败次数 | 退避间隔 | 与 1h 比较 | 实际 nextUpdate |
+|------------|---------|-----------|----------------|
+| 1 | 1 分钟 | < 1h | 1 分钟后 |
+| 2 | 4 分钟 | < 1h | 4 分钟后 |
+| 3 | 9 分钟 | < 1h | 9 分钟后 |
+| 4 | 16 分钟 | < 1h | 16 分钟后 |
+| 5 | 25 分钟 | < 1h | 25 分钟后 |
+| 6+ | 仍按 25 分钟（封顶） | < 1h | 25 分钟后 |
 
-一旦某次请求成功，[scheduleNextUpdate()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget.go#L343-L348) 会把 `updateRetriedTimes` 归零，下次又回到 1 小时正常周期。
+但这个"25 分钟后"只意味着 `requiresUpdate()` 会返回 true，**真正触发刷新还要等下一次用户访问页面**。如果用户在退避时间窗口内根本没来访问，退避就毫无意义——下一次访问时直接判断 `now.After(nextUpdate)` 为 true，立刻刷新。
 
-### 5.3 worker 池层面的容错
+一旦某次刷新成功（分支 3），`scheduleNextUpdate()` 会把 `updateRetriedTimes = 0`，退避计数器完全归零。
 
-并发请求在 [workerPoolDo()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-utils.go#L184-L242) 里不会因为单个任务失败就中止整个批次。每个 worker 的结果和错误分别放到独立数组，Videos widget 在拿到 `errs[i]` 后只是 `slog.Error` 记一条日志并 `continue`，不影响其他频道的视频入库。
+### 5.6 worker 池层面的容错：单 channel 失败不传染
+
+[fetchYoutubeChannelUploads()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-videos.go#L160-L215) 中：
+
+```go
+responses, errs, err := workerPoolDo(job)
+
+for i := range responses {
+    if errs[i] != nil {
+        failed++
+        slog.Error("Failed to fetch youtube feed", "channel", channelOrPlaylistIDs[i], "error", errs[i])
+        continue   // 只记日志，跳过这个频道
+    }
+    // ... 处理成功频道的视频
+}
+```
+
+单个 HTTP 请求失败（网络超时、YouTube 500、404 等）只会让对应频道的视频丢失，不会让整个批次失败。只有 `workerPoolDo` 本身返回 `err`（context 取消等非常罕见的情况）或者所有 `len(videos) == 0` 才会走到 `errNoContent` 分支。
 
 ---
 
@@ -427,7 +533,9 @@ func (v videoList) sortByNewest() videoList {
 
 ---
 
-## 七、直播状态接入：刷新频率、排序与展示样式的关联
+## 七、直播状态接入：机制限制与改造方向
+
+接入直播状态不是简单加个 `IsLive` 字段就完事。现有 widget 框架在刷新触发、缓存粒度、错误通道等方面都有硬性约束，会直接限制直播功能的设计空间。
 
 ### 7.1 Videos widget 现状
 
@@ -444,13 +552,97 @@ type video struct {
 }
 ```
 
-**没有任何直播相关字段**（如 `IsLive`、`LiveSince`、`ViewersCount`）。对应的前端模板 [video-card-contents.html](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/templates/video-card-contents.html) 和 [videos-vertical-list.html](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/templates/videos-vertical-list.html) 也没有 LIVE 徽章、观看人数等 UI。
+**没有任何直播相关字段**（如 `IsLive`、`LiveSince`、`ViewersCount`）。对应的前端模板也没有 LIVE 徽章、观看人数等 UI。
 
 原因：Videos widget 当前只消费 YouTube 的 RSS feed，而 RSS feed 只包含"已发布的上传视频"，不含直播调度信息。要拿到直播状态需要额外走 YouTube Data API / GQL。
 
-### 7.2 参照：Twitch Channels widget 的完整实现
+### 7.2 框架限制一：单一 cacheDuration，无法双轨刷新
 
-项目中 Twitch 频道 widget（[widget-twitch-channels.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-twitch-channels.go)）是一份完整的"直播状态怎么接"的参考实现，也展示了刷新频率、排序、样式三者的绑定关系。
+每个 widget 只有一套缓存参数，在 `widgetBase` 里：
+
+```go
+type widgetBase struct {
+    cacheDuration  time.Duration
+    cacheType      cacheType
+    nextUpdate     time.Time
+    // ...
+}
+```
+
+`initialize()` 里一次性设定后就不能拆开了：
+
+```go
+widget.withTitle("Videos").withCacheDuration(time.Hour)
+```
+
+但直播和上传视频对新鲜度的要求完全不同：
+
+| 数据 | 合理刷新周期 | 原因 |
+|------|------------|------|
+| 已上传视频列表 | 1 小时 | 新视频发布不会很频繁，RSS 本身也有延迟 |
+| 直播在播状态 | 5~10 分钟 | 开播/下播随时可能发生，1 小时延迟完全不可用 |
+| 实时观众数 | 1 分钟以内 | 观众数是秒级变化的 |
+
+Twitch Channels widget 用的是 10 分钟缓存，那是因为它**只有直播状态**这一种数据，可以做折中。但 Videos widget 要同时承载"历史视频 + 直播状态"两种生命周期差异巨大的数据，单一 `cacheDuration` 就成了瓶颈：
+
+- 设为 1 小时：直播状态完全不可用
+- 设为 10 分钟：上传视频的 RSS 被过度请求，浪费 YouTube 带宽和自己的请求配额
+
+**可行的改造方向**：
+1. 在 `videosWidget` 内部维护第二套 `liveNextUpdate` 时间戳，`update()` 里分别判断 RSS 和直播 API 是否该刷，但这需要绕过 `widgetBase.requiresUpdate()` 的单一路径
+2. 或者把直播状态拆成独立的 `twitch-channels` 式 widget，但用户体验就割裂了——视频和直播状态不在同一个卡片里
+
+### 7.3 框架限制二：刷新完全由页面请求驱动，无后台轮询
+
+如 5.4 节所述，更新只在用户访问 `/api/pages/.../content/` 时触发，前端 JS 也不会周期轮询。这意味着：
+
+- 用户打开页面看了一眼后最小化 3 小时 → 3 小时内直播状态不会变
+- 用户一直在看页面但不手动 F5 → `setupDynamicRelativeTime()` 只刷新"X 分钟前"的文字，直播状态不会更新
+- 10 分钟的 `cacheDuration` 只保证"用户第 11 分钟访问时会触发刷新"，不保证"第 10 分钟准时刷新"
+
+如果做直播功能，用户合理的预期是"正在直播的频道旁边，观众数和 LIVE 徽章是实时变化的"。但现有架构连 10 分钟级的准实时更新都做不到，只能在每次页面加载时刷新一次。
+
+**可行的改造方向**：
+1. 前端加 `setInterval` 周期调用 `/api/pages/.../content/` 或新增 `/api/widgets/{id}` 接口（目前 [handleWidgetRequest()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/glance.go#L404-L425) 还是 501 Not Implemented）
+2. 后端加后台 goroutine ticker 定时刷新指定 widget，但这会打破"只在请求时才计算"的简单模型，需要处理并发安全和 goroutine 生命周期
+
+### 7.4 框架限制三：单一 Error / Notice 通道
+
+`widgetBase` 只有一个 `Error` 槽和一个 `Notice` 槽。接入直播 API 后，一个 Videos widget 可能同时遇到多种问题：
+
+- RSS 拉 10 个频道，2 个失败 → 想显示"部分视频可能缺失"
+- 直播 API 单独超时 → 想显示"直播状态暂不可用"
+- 直播 API 遇到 rate limit → 想显示"直播数据已延迟"
+
+但现在 Notice 只能存一个 error，后面的会覆盖前面的。直播 API 和 RSS 其中一个挂了，到底算严重错误（显示红色图标、保留旧数据）还是轻微提示（黄色图标），也没有明确优先级。
+
+**可行的改造方向**：
+- 自定义 `multiError` 类型把多个错误拼起来放进 Notice
+- 或者在 `videosWidget` 里新增 `LiveError`、`FeedError` 两个独立字段，渲染时分别显示
+
+### 7.5 框架限制四：nextUpdate 被严重错误和部分错误共享
+
+`scheduleEarlyUpdate()` 是"任何错误都触发"，不区分是 RSS 挂了还是直播 API 挂了：
+
+- 如果直播 API 超时（5 秒内的临时故障）→ 触发退避，1 分钟后重试，这合理
+- 但如果直播 API 返回 403 Forbidden（API Key 配置错误，永久故障）→ 仍然按 1/4/9/16/25 分钟退避重试，白白消耗资源
+
+代码作者在 TODO 注释里已经意识到这个问题：
+
+```go
+// TODO: needs covering more edge cases.
+// ... need some kind of mechanism that tells us whether we should update early
+// or not depending on the number of things that failed during the initial
+// and subsequent update and how they failed - ie whether it was server
+// error (like gateway timeout, do retry early) or client error (like
+// hitting a rate limit, don't retry early).
+```
+
+接入直播后这个问题会被放大：直播 API 和 RSS 有不同的失败模式（403/429/5xx/超时），应该有不同的退避策略，但现在是一锅端。
+
+### 7.6 参照：Twitch Channels widget 的实现
+
+项目中 Twitch 频道 widget（[widget-twitch-channels.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-twitch-channels.go)）是一份完整的参考实现，也展示了在当前框架内能做到的上限。
 
 #### 数据结构
 
@@ -470,21 +662,6 @@ type twitchChannel struct {
     ViewersCount int           // 观众数
 }
 ```
-
-#### 刷新频率对比
-
-| Widget | withCacheDuration | 原因 |
-|--------|-------------------|------|
-| videos | **1 小时** | 已上传视频变化慢，RSS 够了 |
-| twitch-channels | **10 分钟** | 直播状态变化快，下播/开播都需要及时反映 |
-| twitch-top-games | **10 分钟** | 同上 |
-
-如果 Videos widget 接入 YouTube 直播，1 小时刷新肯定不够——主播开播 1 小时后用户才看到就失去了意义。合理的做法是**双轨刷新**：
-
-- RSS 拉上传视频：仍然 1 小时
-- 直播 API 拉在播状态：5~10 分钟（与 Twitch 同量级）
-
-也可以只给配置了特定频道的用户启用直播轮询，避免所有 Videos widget 都加 API 调用开销。
 
 #### 排序：两种模式的差异
 
@@ -538,16 +715,19 @@ func (channels twitchChannelList) sortByLive() {
 
 两种渲染分支意味着**所有直播 UI 改动都要做两遍**，除非先把纵向列表改造成也复用 `video-card-contents.html` 的子模板。
 
-### 7.3 接入影响总览
+### 7.7 接入影响总览
 
-| 维度 | 当前 Videos | 接入直播后需要变更 |
-|------|------------|------------------|
-| 刷新频率 | 1 小时 | 拆成双轨：视频 RSS 1h + 直播 API 5~10min |
-| video 结构体 | 6 字段 | 加 `IsLive`、`LiveSince`、`LiveViewers`、`StreamTitle`、`Category` |
-| 排序 | `sort.Slice` 按时间 | 加 `sort.SliceStable` 直播置顶模式，离线用哨兵值避免 |
-| 默认/网格样式 | `video-card-contents.html` | 加 LIVE 徽章、观众数、预览 popover |
-| 纵向列表样式 | `videos-vertical-list.html` 独立分支 | 单独加 LIVE 标签、直播时长，或先重构复用子模板 |
-| 错误图标 | `notice-icon-minor`（黄色） | 直播 API 单独超时不要影响已上传视频展示 |
+| 维度 | 当前 Videos | 接入直播后需要变更 | 限制级别 |
+|------|------------|------------------|---------|
+| 刷新频率 | 1 小时，单一值 | 需要双轨：RSS 1h + 直播 API 5~10min | 🔴 框架限制，需改 widgetBase 或绕过 |
+| 刷新触发 | 仅页面请求时 | 前端加周期轮询或后台 ticker | 🔴 架构限制 |
+| video 结构体 | 6 字段 | 加 `IsLive`、`LiveSince`、`LiveViewers`、`StreamTitle`、`Category` | 🟢 简单改动 |
+| 排序 | `sort.Slice` 按时间 | 加 `sort.SliceStable` 直播置顶模式，离线用哨兵值 | 🟡 需改动排序函数 |
+| 错误通道 | 单一 Error/Notice | 需要区分 RSS 错误和直播错误 | 🟡 中等改动 |
+| 退避策略 | 不区分错误类型 | 区分超时/限流/权限错误的退避 | 🟡 作者已标 TODO |
+| 默认/网格样式 | `video-card-contents.html` | 加 LIVE 徽章、观众数、预览 popover | 🟢 模板改动 |
+| 纵向列表样式 | 独立分支 | 单独加 LIVE 标签、直播时长，或先重构复用子模板 | 🟡 中等改动 |
+| ContentAvailable | 单向锁 true | 保留现状即可（旧数据+红色图标的 graceful degradation 对直播是合理的） | ✅ 无需改动 |
 
 ---
 
@@ -560,36 +740,45 @@ func (channels twitchChannelList) sortByLive() {
         ├─ Playlists 加前缀 → 并入 Channels
         └─ withCacheDuration(time.Hour)   // 应用层缓存 1h
     ↓
-页面请求 (glance.go handlePageContentRequest)
-    ↓ page.updateOutdatedWidgets()
-        ↓ widget.requiresUpdate() 判断是否到刷新时间
-            ↓ widget.update(ctx)
-                ↓ fetchYoutubeChannelUploads(Channels, ...)
-                    ├─ 按前缀/UC 判定 → 构造 playlist_id 或 channel_id URL
-                    ├─ 30 worker 并发 GET YouTube RSS
-                    ├─ XML → youtubeFeedResponseXml
-                    ├─ 每条 entry → video 结构体（TimePosted 解析失败→time.Now→置顶）
-                    ├─ 跨频道 sortByNewest()
-                    └─ 截断到 Limit 条
-                ↓ 错误处理（widgetBase.canContinueUpdateAfterHandlingErr）
-                    ├─ errNoContent → 红色 ERROR + 指数退避重试（1m,4m,9m,16m,25m）
-                    ├─ errPartialContent → 黄色感叹号 + 保留部分数据 + 退避重试
-                    └─ nil → scheduleNextUpdate()，1h 后再见
-    ↓ Render()
-        ├─ style=="grid-cards" → videos-grid.html → 复用 video-card-contents.html
-        ├─ style=="vertical-list" → videos-vertical-list.html（完全独立分支）
-        └─ default → videos.html → 横向轮播，复用 video-card-contents.html
-            └─ <img loading="lazy" src="YouTube CDN">  ← 浏览器懒加载+CDN缓存
+用户浏览器加载页面 (page.js setupPage)
+    ↓ fetchPageContent() 仅调用一次，无周期轮询
+    ↓ HTTP GET /api/pages/{slug}/content/
+        ↓ handlePageContentRequest() 拿 page.mu 互斥锁
+            ↓ page.updateOutdatedWidgets()
+                ↓ 遍历所有 widget，调 requiresUpdate(now)
+                    ├─ nextUpdate.IsZero() → 首次必刷
+                    └─ now.After(nextUpdate) → 到期才刷
+                        ↓ widget.update(ctx)  并发 goroutine 执行
+                            ↓ fetchYoutubeChannelUploads(Channels, ...)
+                                ├─ 按前缀/UC 判定 → 构造 playlist_id 或 channel_id URL
+                                ├─ 30 worker 并发 GET YouTube RSS
+                                ├─ XML → youtubeFeedResponseXml
+                                ├─ TimePosted 解析失败→time.Now→置顶
+                                ├─ 跨频道 sortByNewest()
+                                └─ 截断到 Limit 条
+                            ↓ canContinueUpdateAfterHandlingErr(err) 状态机：
+                                ├─ errNoContent
+                                │   ├─ ContentAvailable==false → 全屏 ERROR，下一次 1m/4m/9m... 后
+                                │   └─ ContentAvailable==true  → 旧内容 + 红色 major 图标，保留旧 Videos
+                                ├─ errPartialContent → 部分内容 + 黄色 minor 图标，Videos 被更新
+                                └─ nil → 干净内容，scheduleNextUpdate() 归零退避，1h 后再见
+            ↓ 释放锁，渲染模板返回 HTML
+                ↓ Render()
+                    ├─ style=="grid-cards" → videos-grid.html → 复用 video-card-contents.html
+                    ├─ style=="vertical-list" → videos-vertical-list.html（完全独立分支）
+                    └─ default → videos.html → 横向轮播，复用 video-card-contents.html
+                        └─ <img loading="lazy" src="YouTube CDN">  ← 浏览器懒加载+CDN缓存
 ```
 
 整个流程的核心文件：
 
 - [widget-videos.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-videos.go) — 视频源聚合主逻辑
-- [widget.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget.go) — widget 基类（缓存调度、错误处理、指数退避重试）
+- [widget.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget.go) — widget 基类（ContentAvailable 单向锁、Error/Notice 状态机、指数退避重试）
+- [glance.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/glance.go) — 请求驱动刷新链路（handlePageContentRequest → updateOutdatedWidgets）
 - [widget-utils.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-utils.go) — 并发 worker pool、XML/JSON 解码
-- [widget-twitch-channels.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-twitch-channels.go) — 直播状态参考实现（刷新频率、稳定排序、LIVE UI）
+- [widget-twitch-channels.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-twitch-channels.go) — 直播状态参考实现（稳定排序、LIVE UI、10min 缓存）
 - [widget-rss.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-rss.go) — ETag/Last-Modified 条件缓存参考实现
 - [video-card-contents.html](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/templates/video-card-contents.html) — 默认/网格样式卡片子模板
 - [videos-vertical-list.html](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/templates/videos-vertical-list.html) — 纵向列表独立渲染模板
-- [widget-base.html](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/templates/widget-base.html) — ERROR 面板、notice 图标
-- [page.js](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/static/js/page.js) — 轮播、折叠、懒加载图片、相对时间更新
+- [widget-base.html](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/templates/widget-base.html) — ERROR 面板、major/minor notice 图标条件渲染
+- [page.js](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/static/js/page.js) — 轮播、折叠、懒加载、相对时间更新（不做内容轮询）
