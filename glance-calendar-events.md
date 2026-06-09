@@ -10,13 +10,13 @@
 
 | 文件 | 作用 |
 |------|------|
-| [widget-calendar.go](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/widget-calendar.go) | 新版日历后端（Go），仅做配置解析与模板渲染 |
-| [widget-old-calendar.go](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/widget-old-calendar.go) | 旧版日历后端（Go），服务端生成日期数组 |
-| [calendar.js](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/static/js/calendar.js) | **新版日历全部逻辑所在**：日期生成、月切换、动画 |
-| [calendar.html](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/templates/calendar.html) | 新版日历模板 |
-| [old-calendar.html](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/templates/old-calendar.html) | 旧版日历模板 |
-| [widget-clock.go](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/widget-clock.go) | 时钟组件后端，包含时区校验逻辑 |
-| [page.js](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/static/js/page.js) | 时钟前端，包含 `timeInZone()` 时区转换函数 |
+| `internal/glance/widget-calendar.go` | 新版日历后端（Go），仅做配置解析与模板渲染 |
+| `internal/glance/widget-old-calendar.go` | 旧版日历后端（Go），服务端生成日期数组 |
+| `internal/glance/static/js/calendar.js` | **新版日历全部逻辑所在**：日期生成、月切换、动画 |
+| `internal/glance/templates/calendar.html` | 新版日历模板 |
+| `internal/glance/templates/old-calendar.html` | 旧版日历模板 |
+| `internal/glance/widget-clock.go` | 时钟组件后端，包含时区校验逻辑 |
+| `internal/glance/static/js/page.js` | 时钟前端，包含 `timeInZone()` 时区转换函数 |
 
 ---
 
@@ -26,9 +26,9 @@
 
 架构上是**"后端给配置，前端算一切"**：
 
-1. Go 后端只解析 `first-day-of-week`，把它转成整数 `FirstDay`（Sunday=0 … Saturday=6），写入 HTML data 属性。见 [widget-calendar.go#L21-L41](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/widget-calendar.go#L21-L41)。
-2. 模板只输出一个空的 `<div class="calendar" data-first-day-of-week="..."></div>`，不含任何日期。见 [calendar.html#L1-L7](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/templates/calendar.html#L1-L7)。
-3. 页面加载时，前端 JS 通过 `setupCalendars()` 动态导入 `calendar.js`，**在浏览器里完全计算并渲染所有日期**。见 [page.js#L634-L639](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/static/js/page.js#L634-L639)。
+1. Go 后端只解析 `first-day-of-week`，把它转成整数 `FirstDay`（Sunday=0 … Saturday=6），写入 HTML data 属性。见 `internal/glance/widget-calendar.go` 第 21-41 行。
+2. 模板只输出一个空的 `<div class="calendar" data-first-day-of-week="..."></div>`，不含任何日期。见 `internal/glance/templates/calendar.html`。
+3. 页面加载时，前端 JS 通过 `setupCalendars()` 动态导入 `calendar.js`，**在浏览器里完全计算并渲染所有日期**。见 `internal/glance/static/js/page.js` 第 634-639 行。
 
 优点：可交互（上/下月切换、回退到当月按钮、翻页动画）、不消耗服务端算力。
 缺点：所有逻辑依赖浏览器 `Date` 对象，天然受客户端本地时区影响。
@@ -37,8 +37,8 @@
 
 架构上是**"后端算好日期数组，模板直接渲染"**：
 
-1. Go 后端在 `update()` 里调用 `newCalendar(time.Now(), widget.StartSunday)` 生成一个 21 天的日期数组（上一周 + 当前周 + 下一周）。见 [widget-old-calendar.go#L23-L26](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/widget-old-calendar.go#L23-L26)。
-2. 模板直接 `range .Calendar.Days` 输出。见 [old-calendar.html#L28-L32](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/templates/old-calendar.html#L28-L32)。
+1. Go 后端在 `update()` 里调用 `newCalendar(time.Now(), widget.StartSunday)` 生成一个 21 天的日期数组（上一周 + 当前周 + 下一周）。见 `internal/glance/widget-old-calendar.go` 第 23-26 行。
+2. 模板直接 `range .Calendar.Days` 输出。见 `internal/glance/templates/old-calendar.html` 第 28-32 行。
 
 优点：确定性高，服务端控制时区。
 缺点：无交互，只能看三周视图，代码已标注 TODO 要重构。
@@ -50,7 +50,7 @@
 ### 3.1 新版日历（前端 JS）——完整月视图 6×7 = 42 格
 
 核心函数：`Dates(firstDay)` 组件内部的 `updateFullMonth(now, newDate)`。
-见 [calendar.js#L130-L193](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/static/js/calendar.js#L130-L193)。
+见 `internal/glance/static/js/calendar.js` 第 130-193 行。
 
 关键常量：
 ```js
@@ -89,7 +89,7 @@ const nextMonthSpilloverDays = FULL_MONTH_SLOTS - (previousMonthSpilloverDays + 
 const previousMonthDays = daysInMonth(newDate.getFullYear(), newDate.getMonth() - 1);
 ```
 
-- `daysInMonth(year, month)` 的实现很巧妙：`new Date(year, month + 1, 0).getDate()`，即下个月的第 0 天 = 当月最后一天。见 [calendar.js#L199-L201](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/static/js/calendar.js#L199-L201)。
+- `daysInMonth(year, month)` 的实现很巧妙：`new Date(year, month + 1, 0).getDate()`，即下个月的第 0 天 = 当月最后一天。见 `internal/glance/static/js/calendar.js` 第 199-201 行。
 - `new Date(year, month - 1, ...)` 即使 month 是 0（January）也没问题，JS 会自动回退到上一年 12 月。
 
 然后按顺序填充 42 个格子：
@@ -109,7 +109,7 @@ const currentDate = now.getDate();
 ### 3.2 旧版日历（后端 Go）——三周视图 21 格
 
 核心函数：`newCalendar(now time.Time, startSunday bool) *calendar`。
-见 [widget-old-calendar.go#L42-L82](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/widget-old-calendar.go#L42-L82)。
+见 `internal/glance/widget-old-calendar.go` 第 42-82 行。
 
 ```go
 weekday := now.Weekday()
@@ -123,7 +123,47 @@ startDaysFrom := now.Day() - int(weekday) - 7   // 再往前多退 7 天，即�
 - `< 1` 时回退到上一个月：`previousMonthDays + day`
 - `> currentMonthDays` 时前进到下一个月：`day - currentMonthDays`
 
-注意旧版的 `daysInMonth()` 也是同样的"下个月第 0 天"技巧，但用的是 `time.UTC` 固定时区。见 [widget-old-calendar.go#L84-L86](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/widget-old-calendar.go#L84-L86)。
+#### 重要修正：`daysInMonth` 使用 `time.UTC` **不构成时区问题**
+
+`daysInMonth` 定义如下（`internal/glance/widget-old-calendar.go` 第 84-86 行）：
+```go
+func daysInMonth(m time.Month, year int) int {
+    return time.Date(year, m+1, 0, 0, 0, 0, 0, time.UTC).Day()
+}
+```
+
+之前的分析误认为这里用 `time.UTC` 会引入时区偏差——这是错误的。`daysInMonth` 的职责只是回答"某年某月有多少天"（28/29/30/31），这是一个**纯日历属性**，与时区完全无关。无论你在 UTC 还是 Asia/Shanghai，2024 年 2 月都是 29 天。用 `time.UTC` 只是为了创建一个临时 `time.Time` 对象来取 `Day()`，不会产生任何时区相关的偏差。
+
+#### 真正的 Bug：ISOWeek year 与日历年混用
+
+旧版日历的真实问题不在于时区，而在于年的来源：
+
+```go
+year, week := now.ISOWeek()   // ← ISO 周年，不一定等于日历年！
+...
+currentMonthDays := daysInMonth(now.Month(), year)   // ← 用 ISO 周年 + 日历月
+...
+if previousMonthNumber := now.Month() - 1; previousMonthNumber < 1 {
+    previousMonthDays = daysInMonth(12, year-1)      // ← 跨年时 year-1 也是错的
+}
+...
+CurrentYear: year,   // ← 界面上显示的年份也是 ISO 周年
+```
+
+`time.Time.ISOWeek()` 返回的是 ISO 8601 周编号体系下的"周年"和"周号"，规则是：
+- 每周从周一开始
+- 一年的第 1 周是包含该年第一个周四的那一周
+
+这意味着**1 月初的几天可能属于上一年的 ISO 周，12 月底的几天可能属于下一年的 ISO 周**。例如：
+- 2023-01-01（周日）：`ISOWeek()` 返回 `(2022, 52)`，但 `now.Month()` = January，`now.Year()` = 2023
+- 2024-12-30（周一）：`ISOWeek()` 返回 `(2025, 1)`，但 `now.Month()` = December，`now.Year()` = 2024
+
+当前代码把 ISO 周年 `year` 和日历月 `now.Month()` 直接混用，理论上会算错天数。不过由于：
+- 只有 1 月和 12 月才会出现 ISO 周年 ≠ 日历年
+- 1 月、12 月的天数固定为 31 天，与年份无关
+- 2 月的闰年差异不可能出现在 ISO 周年错配的场景里
+
+所以**这个 bug 在实际运行中几乎不会产生可观察的错误**，但从代码正确性角度，`year` 应该取 `now.Year()` 而不是 `now.ISOWeek()` 的返回值。界面上显示的 `CurrentYear` 同样应该用日历年。
 
 ---
 
@@ -134,7 +174,7 @@ startDaysFrom := now.Day() - int(weekday) - 7   // 再往前多退 7 天，即�
 ### 4.1 新版日历
 
 配置字段 `first-day-of-week`，可选值 `sunday` 到 `saturday`，默认 `monday`。
-见 [widget-calendar.go#L11-L37](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/widget-calendar.go#L11-L37)。
+见 `internal/glance/widget-calendar.go` 第 11-37 行。
 
 映射表：
 ```go
@@ -148,15 +188,15 @@ var calendarWeekdaysToInt = map[string]time.Weekday{
 
 前端拿到这个整数后有**两处**使用：
 
-1. **星期表头顺序**：`WEEKDAY_ABBRS[(firstDay + i) % 7]`，见 [calendar.js#L184-L186](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/static/js/calendar.js#L184-L186)。
+1. **星期表头顺序**：`WEEKDAY_ABBRS[(firstDay + i) % 7]`，见 `internal/glance/static/js/calendar.js` 第 184-186 行。
 2. **上月 spillover 天数**：就是上面 3.1 节的 `previousMonthSpilloverDays` 公式。
 
 ### 4.2 旧版日历
 
 配置字段 `start-sunday`（布尔），默认 `false`（即周一起始）。
-见 [widget-old-calendar.go#L14](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/widget-old-calendar.go#L14)。
+见 `internal/glance/widget-old-calendar.go` 第 14 行。
 
-模板里用 `{{ if .StartSunday }}` 决定是否把 Su 放在最前面。见 [old-calendar.html#L13-L26](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/templates/old-calendar.html#L13-L26)。
+模板里用 `{{ if .StartSunday }}` 决定是否把 Su 放在最前面。见 `internal/glance/templates/old-calendar.html` 第 13-26 行。
 
 ---
 
@@ -166,8 +206,8 @@ var calendarWeekdaysToInt = map[string]time.Weekday{
 
 这是一个非常重要的观察：
 
-- **新版日历**完全依赖浏览器 `new Date()`，即客户端本地时区。对于跨时区用户（比如服务器在 UTC，人在 Asia/Shanghai），"今天"的判定是以用户电脑为准。
-- **旧版日历**使用 Go 服务端的 `time.Now()`，然后 `daysInMonth()` 里用 `time.UTC` 计算。这在极端的时区边界（比如服务器在 UTC+14、客户端在 UTC-12）会出现"服务端和客户端认为'今天'不是同一天"的问题。
+- **新版日历**完全依赖浏览器 `new Date()`，即客户端本地时区。对于跨时区用户（比如服务器在 UTC，人在 Asia/Shanghai），"今天"的判定是以用户电脑为准——这通常是正确的行为，但也意味着无法通过服务端配置强制统一时区。
+- **旧版日历**使用 Go 服务端的 `time.Now()`，即**服务端进程所在的本地时区**（取决于操作系统的 `TZ` 环境变量或系统设置）。如果用户和服务器不在同一时区，看到的"今天"、当前周号、月份名称可能与用户本地时间不一致。注意：`daysInMonth` 里的 `time.UTC` 与时区问题无关（见 3.2 节修正）。
 
 ### 5.2 项目中其他地方的时区实现可供参考
 
@@ -179,7 +219,7 @@ if _, err := time.LoadLocation(widget.Timezones[t].Timezone); err != nil {
     return fmt.Errorf("invalid timezone '%s': %v", ...)
 }
 ```
-见 [widget-clock.go#L31-L38](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/widget-clock.go#L31-L38)。
+见 `internal/glance/widget-clock.go` 第 31-38 行。
 
 **前端转换**（JS）：
 ```js
@@ -189,7 +229,7 @@ function timeInZone(now, zone) {
     return { time: timeInZone, diffInMinutes: diffInMinutes };
 }
 ```
-见 [page.js#L532-L546](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/static/js/page.js#L532-L546)。
+见 `internal/glance/static/js/page.js` 第 532-546 行。
 
 这个函数的技巧是利用 `toLocaleString` 的 `{ timeZone }` 选项把一个 `Date` 对象"看起来变成"目标时区的本地时间，再重新解析成 Date。虽然不够优雅，但在浏览器原生 API 里是最通用的做法。
 
@@ -205,19 +245,19 @@ function timeInZone(now, zone) {
 
 基于现有代码结构，建议的接入路径：
 
-**后端（Go）侧**：在 [widget-calendar.go](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/widget-calendar.go) 中扩展：
+**后端（Go）侧**：在 `internal/glance/widget-calendar.go` 中扩展：
 - 新增配置字段，如 `holiday-providers`、`ical-urls`、`timezone`
 - 引入 iCal 解析库（如 `github.com/arran4/golang-ical`）拉取并解析 ICS
 - 把事件按日期（YYYY-MM-DD）聚合成一个 `map[string][]CalendarEvent`，JSON 序列化后通过模板 data 属性下发给前端（类似 `data-first-day-of-week` 的做法）
 
-**前端（JS）侧**：在 [calendar.js](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/static/js/calendar.js) 的 `updateFullMonth()` 中扩展：
+**前端（JS）侧**：在 `internal/glance/static/js/calendar.js` 的 `updateFullMonth()` 中扩展：
 - 目前每个格子只 `.text(i)` 写日期数字；可以在这一步查找该日期对应的事件数组
 - **"事件合并"的边界判断**：一个日期格子可能同时有 `spillover`（属于相邻月但显示在本月视图里）、`current-date`（今天）、以及多个事件。优先级建议：
   1. 先确定该格子的**归属日期**（考虑 spillover 和时区，是上月/当月/下月的哪一天）
   2. 再按归属日期去事件表里查
   3. 同一天多个事件的合并策略：按开始时间排序，超过 N 个时折叠显示 "+N more"
 
-**CSS 侧**：[widget-calendar.css](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/static/css/widget-calendar.css) 中 `.calendar-date` 已经是 `position: relative`，可以直接在里面 `::after` 画事件小圆点，或追加事件徽标元素。
+**CSS 侧**：`internal/glance/static/css/widget-calendar.css` 中 `.calendar-date` 已经是 `position: relative`，可以直接在里面 `::after` 画事件小圆点，或追加事件徽标元素。
 
 ---
 
@@ -232,7 +272,7 @@ const autoAdvanceNow = () => {
     }, msTillNextDay());
 };
 ```
-见 [calendar.js#L51-L57](file:///d:/fz/0601/solo-dogfeeding/code/139-glance/internal/glance/static/js/calendar.js#L51-L57)。
+见 `internal/glance/static/js/calendar.js` 第 51-57 行。
 
 `msTillNextDay()` 计算距离下一个本地零点还有多少毫秒，确保"今天"的高亮会在零点自动切换。但代码里有个 TODO：`// TODO: don't auto advance if looking at a different month`——目前即便你在看上/下个月，零点时也会强行跳回当月。
 
@@ -245,7 +285,8 @@ const autoAdvanceNow = () => {
 | 日期生成 | JS `Date`，42 格月视图 | Go `time.Time`，21 格三周视图 | |
 | 周起始配置 | 7 种可选，默认周一 | 二选一（周日/周一），默认周一 | |
 | 跨月 spillover 边界 | `(firstWeekday - firstDay + 7) % 7 \|\| 7` | `startDaysFrom - weekday - 7` | 新版的 `\|\| 7` 是关键边界 |
-| 时区处理 | 隐式使用浏览器本地时区 | `time.Now()` + `time.UTC` 混用 | **均无显式配置** |
+| 时区处理 | 隐式使用浏览器本地时区 | 隐式使用服务端本地时区 | **均无显式配置**。旧版 `daysInMonth` 中的 `time.UTC` 不构成时区问题 |
+| 其他已知 Bug | 无 | ISOWeek year 与日历年混用 | 实际影响极小，但代码不正确（见 3.2 节） |
 | 事件/节假日 | ❌ 未实现 | ❌ 未实现 | 需按 6.2 节扩展 |
 | 事件合并 | ❌ 未实现 | ❌ 未实现 | 关键边界：先确定格子归属日期，再查事件 |
 | 自动跨天 | ✅ 零点定时器 | ❌ 依赖整点缓存刷新 | |
