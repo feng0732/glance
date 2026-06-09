@@ -191,7 +191,7 @@ sunsetBar  := (time.Unix(int64(responseJson.Daily.Sunset[0]),  0).In(place.locat
 ```
 
 - **触发条件**：API 返回了 `daily` 字段但 `sunrise` 或 `sunset` 数组为空（长度 0）
-- **后果**：Go 运行时 `index out of range` panic，整个 Widget 更新 goroutine 崩溃，`widget.Weather` 保持 `nil`，下次 `update()` 重新尝试
+- **后果**：Go 运行时 `index out of range` panic。`weatherWidget.update()` 方法内及启动它的 goroutine 处均无 recover，panic 将沿调用栈传播至 goroutine 顶层，Go runtime 检测到未恢复 panic 后**终止整个进程**（详见第六章）
 - **现实概率**：极低。Open-Meteo 在 `forecast_days=1` 时通常返回恰好 1 条日出/日落数据，但理论上极区极昼/极夜、或 API 故障时可能返回空数组
 
 #### 风险 ②：温度与降水概率长度不一致导致 panic（核心风险）
@@ -211,7 +211,7 @@ if len(responseJson.Hourly.Temperature) == 24 {    // 仅校验 Temperature
 ```
 
 - **触发条件**：`len(Temperature) == 24` 通过了守卫，但 `len(PrecipitationProbability) < 24`（例如 `nil`、长度 1、长度 23 等）
-- **后果**：`p[i]` 或 `p[i+1]` 越界 panic，整个 goroutine 崩溃
+- **后果**：`p[i]` 或 `p[i+1]` 越界 panic。整条调用链（`fetchWeatherForOpenMeteoPlace` → `weatherWidget.update` → goroutine 入口）均无 recover，最终导致**整个进程崩溃退出**（详见第六章）
 - **现实场景**：
   - API 返回结构异常，`hourly` 对象存在但缺少 `precipitation_probability` 字段（此时 p 为 nil 切片，长度 0）
   - Open-Meteo 部分数据缺失，降水概率只返回了部分时段
@@ -233,12 +233,12 @@ if len(responseJson.Hourly.Temperature) == 24 {
 
 | # | 代码位置 | 访问对象 | 有无长度守卫 | 异常场景 | 后果 |
 |---|---------|---------|------------|---------|------|
-| ① | L243 | `Daily.Sunrise[0]` | 无 | sunrise 数组为空 | panic |
-| ② | L244 | `Daily.Sunset[0]` | 无 | sunset 数组为空 | panic |
+| ① | L243 | `Daily.Sunrise[0]` | 无 | sunrise 数组为空 | **进程崩溃** |
+| ② | L244 | `Daily.Sunset[0]` | 无 | sunset 数组为空 | **进程崩溃** |
 | ③ | L261 | `Temperature[i]` / `[i+1]` | 有（`==24`） | 长度 != 24 | 留空降级（安全） |
-| ④ | L264 | `PrecipitationProbability[i]` / `[i+1]` | **无** | 长度 < 24 | **panic** |
+| ④ | L264 | `PrecipitationProbability[i]` / `[i+1]` | **无** | 长度 < 24 | **进程崩溃** |
 
-其中风险 ④（降水概率无校验）是最容易被触发的崩溃路径——温度长度恰好 24 但降水概率缺失或长度不足时，代码直接越界。
+**后果统一说明**：上表中标记"进程崩溃"的三处风险（①②④），其 panic 沿调用链 `fetchWeatherForOpenMeteoPlace` → `weatherWidget.update` → goroutine 入口传播，整条链路均无 recover，最终由 Go runtime 检测到未恢复 panic 后**终止整个进程**。不存在仅单个 Widget 失败或"下次重试"的情况——进程退出后需由外部进程管理器（systemd / Docker）重启。详细分析见第六章。
 
 ---
 
@@ -483,7 +483,7 @@ goroutine A（天气 Widget 更新）
 | 后续请求 | 进程退出，服务停止，所有用户均无法访问 |
 | 下次"重试" | **不存在重试**。进程已死，需由外部进程管理器（systemd / Docker）重启 |
 
-之前对"整个 Widget 更新失败，下次重试"的理解是**错误的**——数组越界 panic 会导致 Glance **整个进程崩溃退出**，而不是仅单个 Widget 失败。
+为什么不是"仅 Widget 失败，下次重试"？原因在于整条调用链无 recover：数组越界 panic 发生在 `fetchWeatherForOpenMeteoPlace` 内，向上经 `weatherWidget.update()` 传播至 goroutine 入口，Go 语言规定**未被 recover 的 panic 会终止整个进程而非仅当前 goroutine**。因此不会出现 Widget 留空但服务继续运行、等待下次调度的情况——整个 Glance 服务会直接退出。
 
 ### 6.3 Recover 缺口盘点
 
