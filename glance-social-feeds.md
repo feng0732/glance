@@ -41,16 +41,33 @@ GET https://hacker-news.firebaseio.com/v0/item/{id}.json
 
 ### 2.2 Reddit
 
-Reddit 的请求构造更复杂，支持 **匿名模式** 和 **OAuth App 模式**，并需要解决 Cloudflare/Reddit 的 JS 挑战获取 `loid` cookie。
+Reddit 的请求构造更复杂，支持 **匿名模式** 和 **OAuth App 模式**。不管哪种模式，都必须解决 Cloudflare/Reddit 的 JS 挑战以获取 `loid` cookie，并默认使用 uTLS 指纹伪装的 HTTP Client。
 
-**基础 URL 选择**
+**两种模式的共同依赖**
 
-[fetchSubredditPosts](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-reddit.go#L167-L295)
+[fetchSubredditPosts](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-reddit.go#L167-L295) 的执行顺序如下：
 
-| 模式 | Base URL | 认证方式 |
-|------|----------|----------|
-| 匿名 | `https://www.reddit.com` | 浏览器 UA + `loid` cookie |
-| OAuth App | `https://oauth.reddit.com` | `Bearer {accessToken}` |
+```
+1. 初始化 client = redditHTTPClient（uTLS 伪装）  ← 两种模式共用默认值
+2. 根据 app.enabled 分支选择 baseURL 和 headers
+3. 构造 query 和 requestURL
+4. 如配置了 RequestURLTemplate → 改写 URL
+   否则如配置了 Proxy.client → client = Proxy.client
+5. 构造 http.Request，设置 headers
+6. 获取 loid cookie 并 AddCookie()               ← 两种模式都无条件执行
+7. 用 client 发起请求
+```
+
+即 `redditHTTPClient`（uTLS 指纹）和 `loid` cookie 是**两种模式共同的前置条件**，仅当用户显式配置了 `proxy:` 时才替换 HTTP Client。认证信息（浏览器 UA vs Bearer Token）才是两种模式的差异点。
+
+**模式差异对照表**
+
+| 项目 | 匿名模式（默认） | OAuth App 模式 |
+|------|-----------------|----------------|
+| Base URL | `https://www.reddit.com` | `https://oauth.reddit.com` |
+| Headers | User-Agent: 模拟 Firefox | Authorization: Bearer {token}<br>User-Agent: {appName}/1.0 |
+| **loid cookie** | ✅ 必须 | ✅ 必须（无条件添加） |
+| **HTTP Client** | `redditHTTPClient`（uTLS） | `redditHTTPClient`（uTLS） |
 
 OAuth Token 获取：[fetchNewAppAccessToken](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-reddit.go#L297-L324)
 
@@ -63,18 +80,27 @@ Header: User-Agent: {appName}/1.0
 
 Token 缓存：在内存中保存至 `tokenExpiresAt`，过期前 1 分钟触发刷新（[widget-reddit.go#L183](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-reddit.go#L183)）。
 
-**端点构造**
+**端点构造（按模式分情况）**
 
-搜索模式：
+[widget-reddit.go#L199-L208](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-reddit.go#L199-L208)
+
+**搜索模式**（`Search != ""`）：
 ```
 {baseURL}/search.json?q={search} subreddit:{subreddit}&sort={sortBy}&limit={limit}
 ```
+- `sort` 始终作为 query param 传入（值为 `widget.SortBy`）
+- **忽略 `TopPeriod`，不添加 `t` 参数**
+- 搜索范围通过 `q` 参数中的 `subreddit:` 语法限定
 
-普通模式：
+**普通模式**（`Search == ""`）：
 ```
-{baseURL}/r/{subreddit}/{sortBy}.json?t={topPeriod}&limit={limit}
+{baseURL}/r/{subreddit}/{sortBy}.json?{query}
 ```
+- `SortBy` 直接嵌入 URL 路径，不作为 query param
+- **仅当 `SortBy == "top"` 时才追加 `t={TopPeriod}`**
+- `hot` / `new` / `rising`：不传 `t` 参数
 
+公共参数：
 - `sortBy`：`hot`（默认）/ `new` / `top` / `rising`
 - `topPeriod`：`day`（默认）/ `hour` / `week` / `month` / `year` / `all`
 - `limit`：仅当 >25 时显式传参（Reddit 默认返回 25 条）
@@ -270,12 +296,15 @@ if errs[i] != nil {
 - 部分失败：返回 `errPartialContent` → widget 显示通知，保留成功帖子
 - 全部成功：无错误
 
-### 6.3 Reddit 匿名模式失败链路
+### 6.3 Reddit 请求失败链路（匿名 / OAuth 通用）
 
-1. HTTP 请求失败 / 非 200 状态 → `decodeJsonFromRequest` 返回错误
+两种模式共享同一条失败路径（loid cookie 和 uTLS 是共同依赖）：
+
+1. OAuth 模式下 Token 获取失败 → `fetching new app access token: ...` 错误，提前返回
 2. loid cookie 获取失败 → 无缓存时直接返回 `could not solve reddit challenge`
-3. 返回空帖子列表 → `no posts found` 错误
-4. 以上任一错误 → `canContinueUpdateAfterHandlingErr` 调度重试 + 显示错误
+3. HTTP 请求失败 / 非 200 状态 → `decodeJsonFromRequest` 返回错误
+4. 返回空帖子列表 → `no posts found` 错误
+5. 以上任一错误 → `canContinueUpdateAfterHandlingErr` 调度指数退避重试 + widget 显示错误
 
 ### 6.4 内容可用性（ContentAvailable）
 
@@ -295,15 +324,68 @@ if err == nil && !w.ContentAvailable {
 
 ## 七、互动度二次排序（Extra Sort）
 
-三个论坛 widget 均支持 `extra-sort-by: engagement`：
+三个论坛 widget 均支持 `extra-sort-by: engagement`。
 
-[calculateEngagement](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-shared.go#L34-L58)
+### 7.1 基础互动度
+
+[calculateEngagement](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-shared.go#L34-L48)
+
+```go
+averageComments = float64(totalComments) / numberOfPosts
+averageScore    = float64(totalScore)    / numberOfPosts
+
+Engagement = (CommentCount / averageComments + Score / averageScore) / 2
+```
+
+以所有帖子的平均值为归一化基准，评论数和点赞数各占 50% 权重。
+
+### 7.2 时间折旧（代码真实行为）
+
+[widget-shared.go#L50-L57](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-shared.go#L50-L57)
+
+```go
+const depreciatePostsOlderThanHours = 7   // 折旧起始阈值
+const maxDepreciation = 0.9               // 最大折旧比例
+const maxDepreciationAfterHours = 24      // 达到最大折旧的"跨度小时数"
+
+if elapsed < 7h {
+    continue  // 7 小时内不折旧
+}
+
+Engagement *= 1.0 - (math.Max(elapsed.Hours() - 7, 24) / 24) * 0.9
+```
+
+**代码用了 `math.Max`（取较大值）而不是 `math.Min`（取较小值），导致行为完全偏离设计意图。**
+
+按代码实际执行：
+
+| 距发布时间 | `math.Max(elapsed-7, 24)` | 折旧系数 | Engagement 保留比例 |
+|-----------|---------------------------|----------|---------------------|
+| 7h（刚到阈值） | `math.Max(0, 24) = 24` | `(24/24)*0.9 = 0.9` | 10%（直接最大折旧） |
+| 10h | `math.Max(3, 24) = 24` | 0.9 | 10% |
+| 30h | `math.Max(23, 24) = 24` | 0.9 | 10% |
+| 31h | `math.Max(24, 24) = 24` | 0.9 | 10% |
+| 55h | `math.Max(48, 24) = 48` | `(48/24)*0.9 = 1.8` | **-80%（负数！）** |
+
+即：**一旦超过 7 小时阈值，帖子立即被折旧 90%（Engagement × 0.1）；超过 31 小时后 Engagement 变为负数，排序会被推到最底部。** 代码中并无将 Engagement clamp 到 ≥ 0 的保护。
+
+### 7.3 设计意图（推测）
+
+从常量命名（`maxDepreciation` 为 0.9、`maxDepreciationAfterHours` 为 24）来看，作者原本希望实现**线性折旧**，公式应为：
 
 ```
-Engagement = (CommentCount / AvgComments + Score / AvgScore) / 2
+// 期望行为：7h 后开始折旧，再经过 24h（即发布后 31h）达到最大折旧 90%
+Engagement *= 1.0 - (math.Min(elapsed.Hours() - 7, 24) / 24) * 0.9
 ```
 
-时间衰减：发布超过 7 小时的帖子按线性折旧，24 小时后最大折旧 90%。
+| 距发布时间 | 期望折旧系数 | 期望保留比例 |
+|-----------|-------------|-------------|
+| 7h | 0 | 100% |
+| 13h | 0.225 | 77.5% |
+| 19h | 0.45 | 55% |
+| 31h+ | 0.9 | 10% |
+
+但由于 `math.Max` vs `math.Min` 的笔误，实际行为与设计意图完全相反。
 
 ## 八、关键文件索引
 
