@@ -355,7 +355,12 @@ mux.Handle(
 > - 内嵌静态资源（`/static/{hash}/`）通过内容 hash 做 URL 指纹，热重载不变
 > - manifest.json 和 custom-css-file 通过 `?v=<CreatedAt>` 做 cache busting，每次热重载 URL 都变（"过度失效"）
 > - LogoURL / FaviconURL / AppIconURL 如果用户自定义为 `/assets/...`，则**完全没有 URL 版本化**，仅依赖 `/assets/` 的 2h Cache-Control — 修改这些资源后用户可能需要等 2 小时或手动清缓存才能看到新内容
-> - LogoURL / FaviconURL / AppIconURL 代码位置：模板引用见 [page.html:22](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/page.html#L22)、[document.html:22](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/document.html#L22)、[document.html:24](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/document.html#L24) — 均无 `?v=` 参数
+> - 模板引用位置：LogoURL [page.html:22](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/page.html#L22)、AppIconURL [document.html:22](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/document.html#L22) + [manifest.json:10](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/manifest.json#L10)、FaviconURL [document.html:24](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/document.html#L24) — 均无 `?v=` 参数
+>
+> **⚠️ BaseURL 处理差异（用户自定义 `/assets/...` 场景）：**
+> - **已处理**（自动加 BaseURL 前缀）：`CustomCSSFile` [glance.go:197](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L197)、`LogoURL` [glance.go:198](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L198)、`FaviconURL` [glance.go:200-204](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L200-L204)
+> - **未处理**（用户自定义时原样保留，不加 BaseURL）：`AppIconURL` [glance.go:216-218](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L216-L218)
+> - 子路径部署时，用户自定义 `app-icon-url: /assets/my-icon.png` 会被浏览器解析为站点根路径 `/assets/my-icon.png`，绕过反向代理的前缀剥离，导致 404。
 
 ---
 
@@ -383,6 +388,26 @@ mux.Handle(
 | 用户资产 `/assets/` 前缀 | [resolveUserDefinedAssetPath()](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L272-L278) |
 
 子路径部署要求：反向代理层剥离前缀 `https://domain/glance/xxx` → `http://backend/xxx`，同时配置 `base-url: /glance`。
+
+#### 用户自定义 Branding 资源的 BaseURL 处理差异（字段级）
+
+`resolveUserDefinedAssetPath(path)` 逻辑：若 `path` 以 `/assets/` 开头则返回 `BaseURL + path`；否则原样返回（外部 URL 如 `https://...` 或其他相对路径）。
+
+但四个 Branding/Theme 字段在 `newApplication()` 中的处理并不一致：
+
+| 配置字段 | 空时默认值 | 用户自定义时是否调用 resolveUserDefinedAssetPath？ | 代码位置 |
+|:---|:---|:---:|:---|
+| `theme.custom-css-file` | 空 → 模板中不渲染 `<link>` 标签 | ✅ 是 | [glance.go:197](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L197) |
+| `branding.logo-url` | 空 → 降级用 `logo-text`，再降级用内置 SVG | ✅ 是 | [glance.go:198](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L198) |
+| `branding.favicon-url` | 空 → `StaticAssetPath("favicon.svg")`（自带 BaseURL） | ✅ 是 | [glance.go:200-204](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L200-L204) |
+| `branding.app-icon-url` | 空 → `StaticAssetPath("app-icon.png")`（自带 BaseURL） | ❌ **否** | [glance.go:216-218](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L216-L218) |
+
+> **⚠️ `app-icon-url` 子路径部署陷阱：**
+> 用户在 YAML 中写 `app-icon-url: /assets/my-icon.png` 时，浏览器会把它解析为站点根路径 `/assets/my-icon.png`，反向代理的前缀剥离（例如从 `/glance/` 剥离）无法生效，最终请求到 `https://domain/assets/my-icon.png` 而非 `https://domain/glance/assets/my-icon.png`，导致 404。
+>
+> 临时绕过方案：用户在配置中手动写全路径 `app-icon-url: /glance/assets/my-icon.png`，或使用外部绝对 URL。
+>
+> `app-icon-url` 同时出现在 HTML head 的 `<link rel="apple-touch-icon">` [document.html:22](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/document.html#L22) 和 PWA manifest 的 `icons[].src` [manifest.json:10](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/manifest.json#L10)，两处都会受此影响。
 
 ---
 
