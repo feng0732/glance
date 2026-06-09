@@ -35,7 +35,7 @@ RSS Widget 并不是每次页面请求都重新抓取，而是由组件级缓存
 
 ### 1.1 缓存配置字段
 
-定义在 `widgetBase` 结构体中，见 [internal/glance/widget.go#L132-L167](internal/glance/widget.go#L132-L167)：
+`cacheType` 枚举与 `widgetBase` 结构体，见 [internal/glance/widget.go#L141-L167](internal/glance/widget.go#L141-L167)：
 
 ```go
 type cacheType int
@@ -47,16 +47,27 @@ const (
 )
 
 type widgetBase struct {
-    CustomCacheDuration durationField    `yaml:"cache"`     // 用户可配置的缓存时长（YAML 字段）
-    cacheDuration       time.Duration    `yaml:"-"`         // 实际生效的缓存时长（运行时字段）
-    cacheType           cacheType        `yaml:"-"`         // 缓存类型
-    nextUpdate          time.Time        `yaml:"-"`         // 下次允许更新的时间点
-    updateRetriedTimes  int              `yaml:"-"`         // 已重试次数（用于指数退避）
-    ContentAvailable    bool             `yaml:"-"`         // 是否已有有效内容
-    Error               error            `yaml:"-"`         // 最近一次致命错误
-    Notice              error            `yaml:"-"`         // 提示性错误（如部分内容缺失）
+    ID                  uint64           `yaml:"-"`          // Widget 唯一标识
+    Providers           *widgetProviders `yaml:"-"`          // 依赖注入的资源提供者
+    Type                string           `yaml:"type"`       // Widget 类型标识
+    Title               string           `yaml:"title"`      // 标题
+    TitleURL            string           `yaml:"title-url"`  // 标题链接
+    HideHeader          bool             `yaml:"hide-header"`// 是否隐藏头部
+    CSSClass            string           `yaml:"css-class"`  // 自定义 CSS 类
+    CustomCacheDuration durationField    `yaml:"cache"`      // 用户可配置的缓存时长（YAML 字段）
+    ContentAvailable    bool             `yaml:"-"`          // 是否已有有效内容
+    WIP                 bool             `yaml:"-"`          // 是否为开发中
+    Error               error            `yaml:"-"`          // 最近一次致命错误
+    Notice              error            `yaml:"-"`          // 提示性错误（如部分内容缺失）
+    templateBuffer      bytes.Buffer     `yaml:"-"`          // 模板渲染缓冲区
+    cacheDuration       time.Duration    `yaml:"-"`          // 实际生效的缓存时长（运行时字段）
+    cacheType           cacheType        `yaml:"-"`          // 缓存类型
+    nextUpdate          time.Time        `yaml:"-"`          // 下次允许更新的时间点
+    updateRetriedTimes  int              `yaml:"-"`          // 已重试次数（用于指数退避）
 }
 ```
+
+其中与 RSS 抓取缓存协作最相关的字段是：`CustomCacheDuration`、`cacheDuration`、`cacheType`、`nextUpdate`、`updateRetriedTimes`、`ContentAvailable`、`Error`、`Notice`。其余字段为通用 Widget 基础设施。
 
 `durationField` 是自定义 YAML 解析类型，支持 `30s`、`5m`、`2h`、`1d` 四种后缀，见 [internal/glance/config-fields.go#L96-L130](internal/glance/config-fields.go#L96-L130)：
 
@@ -68,7 +79,7 @@ type durationField time.Duration
 
 ### 1.2 RSS Widget 的默认缓存配置
 
-在 `initialize()` 中设置默认 2 小时缓存，见 [internal/glance/widget-rss.go#L49-L78](internal/glance/widget-rss.go#L49-L78)：
+在 `initialize()` 中设置默认值，见 [internal/glance/widget-rss.go#L49-L78](internal/glance/widget-rss.go#L49-L78)：
 
 ```go
 func (widget *rssWidget) initialize() error {
@@ -77,13 +88,33 @@ func (widget *rssWidget) initialize() error {
     if widget.Limit <= 0 {
         widget.Limit = 25
     }
-    // ...
+
+    if widget.CollapseAfter == 0 || widget.CollapseAfter < -1 {
+        widget.CollapseAfter = 5
+    }
+
+    if widget.ThumbnailHeight < 0 {
+        widget.ThumbnailHeight = 0
+    }
+
+    if widget.CardHeight < 0 {
+        widget.CardHeight = 0
+    }
+
+    if widget.Style == "detailed-list" {
+        for i := range widget.FeedRequests {
+            widget.FeedRequests[i].IsDetailed = true
+        }
+    }
+
+    widget.NoItemsMessage = "No items were returned from the feeds."
     widget.cachedFeeds = make(map[string]*cachedRSSFeed)
+
     return nil
 }
 ```
 
-`withCacheDuration()` 的逻辑：用户配置优先，否则使用默认值，见 [internal/glance/widget.go#L259-L269](internal/glance/widget.go#L259-L269)：
+`withCacheDuration()` 的逻辑：用户配置优先，否则使用传入的默认值，见 [internal/glance/widget.go#L259-L269](internal/glance/widget.go#L259-L269)：
 
 ```go
 func (w *widgetBase) withCacheDuration(duration time.Duration) *widgetBase {
@@ -195,19 +226,53 @@ func (widget *rssWidget) update(ctx context.Context) {
 }
 ```
 
-`withError()` 方法在 `err == nil` 且当前 `ContentAvailable == false` 时会将 `ContentAvailable` 置为 `true`（标记首次成功），见 [internal/glance/widget.go#L283-L291](internal/glance/widget.go#L283-L291)：
+`withError()` 方法，见 [internal/glance/widget.go#L283-L291](internal/glance/widget.go#L283-L291)：
 
 ```go
 func (w *widgetBase) withError(err error) *widgetBase {
     if err == nil && !w.ContentAvailable {
-        w.ContentAvailable = true
+        w.ContentAvailable = true            // 首次成功时标记内容可用
     }
+
+    w.Error = err                            // 无条件赋值：nil 时清空错误，非 nil 时记录错误
+
+    return w
+}
+```
+
+> **代码事实说明**：`withError()` **不会**在 `err != nil` 时将 `ContentAvailable` 设为 `false`。将 `ContentAvailable = false` 的逻辑实际位于 `renderTemplate()` 中，见 [internal/glance/widget.go#L217-L241](internal/glance/widget.go#L217-L241)，属于模板渲染出错时的处理，与 RSS 抓取错误无关。
+
+`renderTemplate()` 的完整实现：
+
+```go
+func (w *widgetBase) renderTemplate(data any, t *template.Template) template.HTML {
+    w.templateBuffer.Reset()
+    err := t.Execute(&w.templateBuffer, data)
     if err != nil {
-        w.Error = err
         w.ContentAvailable = false
-    } else {
-        w.Error = nil
+        w.Error = err
+
+        slog.Error("Failed to render template", "error", err)
+
+        // 必须立即用错误信息重新渲染，否则 Widget 可能因标签未闭合而破坏页面
+        w.templateBuffer.Reset()
+        err2 := t.Execute(&w.templateBuffer, data)
+
+        if err2 != nil {
+            slog.Error("Failed to render error within widget", "error", err2, "initial_error", err)
+            w.templateBuffer.Reset()
+        }
     }
+
+    return template.HTML(w.templateBuffer.String())
+}
+```
+
+`withNotice()` 方法仅赋值 `Notice` 字段，见 [internal/glance/widget.go#L277-L281](internal/glance/widget.go#L277-L281)：
+
+```go
+func (w *widgetBase) withNotice(err error) *widgetBase {
+    w.Notice = err
     return w
 }
 ```
@@ -219,6 +284,24 @@ func (w *widgetBase) withError(err error) *widgetBase {
 部分错误   → scheduleEarlyUpdate()     → 指数退避，标记为 Notice，仍渲染已有内容
 全部错误   → scheduleEarlyUpdate()     → 指数退避，标记为 Error，不渲染内容
 ```
+
+### 1.6 错误状态字段完整流转表
+
+`Error`、`Notice`、`ContentAvailable` 三个字段在 RSS 抓取场景下的完整状态流转，全部可由 `canContinueUpdateAfterHandlingErr()` 和 `withError()` 的代码直接证明：
+
+| 场景 | Error | Notice | ContentAvailable | 调度方式 |
+|-----|-------|--------|-----------------|---------|
+| 首次成功抓取 | nil | nil | true（由 withError 在 err==nil 时置 true） | scheduleNextUpdate（2h 后） |
+| 首次部分源失败 | nil | errPartialContent | true（首次成功后一直保持） | scheduleEarlyUpdate（n² 分钟退避） |
+| 首次全部源失败 | errNoContent | nil | false（零值，未被 withError 改动） | scheduleEarlyUpdate（n² 分钟退避） |
+| 首次失败后重试又成功 | nil | nil | true（此前若为 false 则被置 true） | scheduleNextUpdate（重试清零） |
+| 模板渲染出错（与 RSS 抓取无关） | 模板错误 | 不变 | false（由 renderTemplate 置 false） | 不影响调度 |
+
+> **关键代码事实**：`ContentAvailable` 的零值是 `false`。当 `withError(err)` 被调用时：
+> - 若 `err == nil && !ContentAvailable` → 置 `true`
+> - 其他任何情况 → **不改变** `ContentAvailable` 的值
+>
+> 因此 RSS 全部源失败时 `withError(errNoContent)` 不会将 `ContentAvailable` 从 `false` 改为 `true`，该字段一直保持零值 `false`，从而前端模板判断无内容可渲染。
 
 ---
 
@@ -248,7 +331,14 @@ func (widget *rssWidget) fetchItemsFromFeeds() (rssFeedItemList, error) {
             slog.Error("Failed to get RSS feed", "url", requests[i].URL, "error", errs[i])
             continue
         }
-        // ... 合并成功的条目，去重
+
+        for _, item := range feeds[i] {
+            if _, exists := seen[item.Link]; exists {
+                continue
+            }
+            entries = append(entries, item)
+            seen[item.Link] = struct{}{}
+        }
     }
 
     if failed == len(requests) {
@@ -375,16 +465,7 @@ func (w *widgetBase) getNextUpdateTime() time.Time {
 
 ### 3.1 请求入口
 
-多源抓取从 `fetchItemsFromFeeds()` 函数启动，见 [internal/glance/widget-rss.go#L152-L190](internal/glance/widget-rss.go#L152-L190)：
-
-```go
-func (widget *rssWidget) fetchItemsFromFeeds() (rssFeedItemList, error) {
-    requests := widget.FeedRequests
-    job := newJob(widget.fetchItemsFromFeedTask, requests).withWorkers(30)
-    feeds, errs, err := workerPoolDo(job)
-    // ...
-}
-```
+多源抓取从 `fetchItemsFromFeeds()` 函数启动，见 [internal/glance/widget-rss.go#L152-L190](internal/glance/widget-rss.go#L152-L190)。
 
 ### 3.2 每个 RSS 源的请求配置
 
@@ -405,7 +486,7 @@ type rssFeedRequest struct {
 
 ### 3.3 HTTP 请求构建
 
-每个 RSS 源的实际请求发生在 `fetchItemsFromFeedTask()`，见 [internal/glance/widget-rss.go#L192-L234](internal/glance/widget-rss.go#L192-L234)：
+每个 RSS 源的实际请求发生在 `fetchItemsFromFeedTask()`，见 [internal/glance/widget-rss.go#L192-L238](internal/glance/widget-rss.go#L192-L238)：
 
 ```go
 func (widget *rssWidget) fetchItemsFromFeedTask(request rssFeedRequest) ([]rssFeedItem, error) {
@@ -416,21 +497,55 @@ func (widget *rssWidget) fetchItemsFromFeedTask(request rssFeedRequest) ([]rssFe
 
     req.Header.Add("User-Agent", glanceUserAgentString)
 
-    // （此处插入 HTTP 缓存协商 Header，详见第四章）
+    // HTTP 缓存协商：从本地缓存读取 ETag / Last-Modified
+    widget.cachedFeedsMutex.Lock()
+    cache, isCached := widget.cachedFeeds[request.URL]
+    if isCached {
+        if cache.etag != "" {
+            req.Header.Add("If-None-Match", cache.etag)
+        }
+        if cache.lastModified != "" {
+            req.Header.Add("If-Modified-Since", cache.lastModified)
+        }
+    }
+    widget.cachedFeedsMutex.Unlock()
 
     for key, value := range request.Headers {
         req.Header.Set(key, value)          // 用户自定义 Header 最后应用，可覆盖默认值
     }
 
     resp, err := defaultHTTPClient.Do(req)
-    // ...
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode == http.StatusNotModified && isCached {
+        return cache.items, nil
+    }
+
+    if resp.StatusCode != http.StatusOK {
+        return nil, fmt.Errorf("unexpected status code %d from %s", resp.StatusCode, request.URL)
+    }
+
+    body, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return nil, err
+    }
+
+    feed, err := feedParser.ParseString(string(body))
+    if err != nil {
+        return nil, err
+    }
+    // 后续字段映射与缓存写入见第五章
 }
 ```
 
 **关键点（均有直接代码支撑）：**
+- `defer resp.Body.Close()` 在 HTTP 请求成功后立即注册，确保响应体最终被关闭
 - User-Agent：`Glance/{version} +https://github.com/glanceapp/glance`，定义在 [internal/glance/widget-utils.go#L46](internal/glance/widget-utils.go#L46-L46)
 - HTTP Client：使用包级 `defaultHTTPClient`，5 秒超时 + 每 Host 10 个空闲连接，定义在 [internal/glance/widget-utils.go#L24-L32](internal/glance/widget-utils.go#L24-L32)
-- 自定义 Header 后设置，可覆盖默认的 User-Agent 等（代码顺序可见）
+- 自定义 Header 最后应用，可覆盖默认的 User-Agent 等（代码顺序可见）
 
 ---
 
@@ -476,7 +591,7 @@ if isCached {
 widget.cachedFeedsMutex.Unlock()
 ```
 
-**工作原理（可由代码直接证明）：**
+**可由代码直接证明的事实：**
 - `If-None-Match`：当 `cache.etag` 非空时附加到请求
 - `If-Modified-Since`：当 `cache.lastModified` 非空时附加到请求
 - 两者独立存在，互不依赖
@@ -577,7 +692,7 @@ if request.Limit > 0 && len(feed.Items) > request.Limit {
 }
 ```
 
-这是**第一层裁剪**（单源级别）。最终所有源合并后还有**第二层裁剪**（Widget 全局 `widget.Limit`），见 [internal/glance/widget-rss.go#L91-L93](internal/glance/widget-rss.go#L91-L93)。
+这是**第一层裁剪**（单源级别）。最终所有源合并后还有**第二层裁剪**（Widget 全局 `widget.Limit`）。
 
 ### 5.4 字段完整映射
 
@@ -596,9 +711,9 @@ type rssFeedItem struct {
 }
 ```
 
-每个字段的映射逻辑如下：
+字段映射发生在 [internal/glance/widget-rss.go#L244-L331](internal/glance/widget-rss.go#L244-L331) 的循环中，每个字段逻辑如下：
 
-**ChannelURL**：直接取自 `feed.Link`，见 [internal/glance/widget-rss.go#L249-L251](internal/glance/widget-rss.go#L249-L251)。
+**ChannelURL**：直接取自 `feed.Link`，见 L249-L251。
 
 **ChannelName**：用户 `request.Title` 优先，否则用 `feed.Title`，见 [internal/glance/widget-rss.go#L306-L310](internal/glance/widget-rss.go#L306-L310)：
 
@@ -646,7 +761,7 @@ if item.Title != "" {
 }
 ```
 
-**Description**：仅在三个条件同时满足时才填充——`request.IsDetailed`、`!request.HideDescription`、`item.Description != ""`、`item.Title != ""`，见 [internal/glance/widget-rss.go#L282-L285](internal/glance/widget-rss.go#L282-L285)：
+**Description**：仅在四个条件同时满足时才填充，见 [internal/glance/widget-rss.go#L282-L285](internal/glance/widget-rss.go#L282-L285)：
 
 ```go
 if request.IsDetailed {
@@ -657,9 +772,9 @@ if request.IsDetailed {
 }
 ```
 
-描述最大长度 200 字符，经过完整的 HTML 清理流程（见下节）。
+条件同时满足：`request.IsDetailed`、`!request.HideDescription`、`item.Description != ""`、`item.Title != ""`。描述最大长度 200 字符，经过完整的 HTML 清理流程。
 
-**Categories**：仅在 `request.IsDetailed && !request.HideCategories` 时填充。每条限制最多 6 个分类，每个分类字符串长度必须在 1~30 之间，见 [internal/glance/widget-rss.go#L287-L303](internal/glance/widget-rss.go#L287-L303)：
+**Categories**：仅在 `request.IsDetailed && !request.HideCategories` 时填充。最多取 6 个分类，每个分类字符串长度必须在 1~30 之间，见 [internal/glance/widget-rss.go#L287-L303](internal/glance/widget-rss.go#L287-L303)：
 
 ```go
 if !request.HideCategories {
@@ -694,7 +809,35 @@ if item.Image != nil {
 }
 ```
 
-`findThumbnailInItemExtensions()` 递归扫描 `media` 命名空间下的扩展节点，见 [internal/glance/widget-rss.go#L346-L374](internal/glance/widget-rss.go#L346-L374)。
+`findThumbnailInItemExtensions()` 先从 `item.Extensions["media"]` 查找，再递归调用 `recursiveFindThumbnailInExtensions()` 扫描子节点，见 [internal/glance/widget-rss.go#L346-L374](internal/glance/widget-rss.go#L346-L374)：
+
+```go
+func findThumbnailInItemExtensions(item *gofeed.Item) string {
+    media, ok := item.Extensions["media"]
+    if !ok {
+        return ""
+    }
+    return recursiveFindThumbnailInExtensions(media)
+}
+
+func recursiveFindThumbnailInExtensions(extensions map[string][]gofeedext.Extension) string {
+    for _, exts := range extensions {
+        for _, ext := range exts {
+            if ext.Name == "thumbnail" || ext.Name == "image" {
+                if url, ok := ext.Attrs["url"]; ok {
+                    return url
+                }
+            }
+            if ext.Children != nil {
+                if url := recursiveFindThumbnailInExtensions(ext.Children); url != "" {
+                    return url
+                }
+            }
+        }
+    }
+    return ""
+}
+```
 
 **PublishedAt**：`item.PublishedParsed` 非 nil 则用其解析值，否则回退为当前时间 `time.Now()`，见 [internal/glance/widget-rss.go#L324-L328](internal/glance/widget-rss.go#L324-L328)：
 
@@ -740,6 +883,41 @@ func shortenFeedDescriptionLen(description string, maxLen int) string {
 
 `sequentialWhitespacePattern` 定义在 [internal/glance/utils.go#L17](internal/glance/utils.go#L17-L17)，`limitStringLength` 定义在 [internal/glance/utils.go#L112](internal/glance/utils.go#L112-L112)。
 
+### 5.6 Render() 模板选择逻辑
+
+RSS Widget 支持 4 种展示样式，在 `Render()` 中根据 `widget.Style` 选择不同模板，见 [internal/glance/widget-rss.go#L98-L112](internal/glance/widget-rss.go#L98-L112)：
+
+```go
+var (
+    rssWidgetTemplate                 = mustParseTemplate("rss-list.html", "widget-base.html")
+    rssWidgetDetailedListTemplate     = mustParseTemplate("rss-detailed-list.html", "widget-base.html")
+    rssWidgetHorizontalCardsTemplate  = mustParseTemplate("rss-horizontal-cards.html", "widget-base.html")
+    rssWidgetHorizontalCards2Template = mustParseTemplate("rss-horizontal-cards-2.html", "widget-base.html")
+)
+
+func (widget *rssWidget) Render() template.HTML {
+    if widget.Style == "horizontal-cards" {
+        return widget.renderTemplate(widget, rssWidgetHorizontalCardsTemplate)
+    }
+
+    if widget.Style == "horizontal-cards-2" {
+        return widget.renderTemplate(widget, rssWidgetHorizontalCards2Template)
+    }
+
+    if widget.Style == "detailed-list" {
+        return widget.renderTemplate(widget, rssWidgetDetailedListTemplate)
+    }
+
+    return widget.renderTemplate(widget, rssWidgetTemplate)
+}
+```
+
+**可由代码直接证明的事实：**
+- 4 个模板均在包级通过 `var` + `mustParseTemplate` 预编译，不会在每次渲染时重复解析
+- `Style` 零值（空字符串）时默认走 `rss-list.html`（普通列表样式）
+- `Style == "detailed-list"` 时会在 `initialize()` 中将所有源的 `IsDetailed` 置为 `true`（见 1.2 节），从而填充 `Description` 和 `Categories` 字段
+- 所有模板最终都调用 `renderTemplate()`，该方法在模板渲染出错时会设置 `ContentAvailable = false`（见 1.5 节）
+
 ---
 
 ## 六、去重与排序
@@ -775,7 +953,7 @@ for i := range feeds {
 ### 6.2 去重与顺序
 
 - 去重保留首次出现：遍历 `feeds` 顺序即用户配置的源顺序（YAML `feeds:` 列表顺序）
-- `feeds[i]` 在 Worker Pool 中按 `index` 回填，与输入顺序严格一致，见 [internal/glance/widget-utils.go#L235-L240](internal/glance/widget-utils.go#L235-L240)
+- `feeds[i]` 在 Worker Pool 中按 `task.index` 回填，与输入顺序严格一致，见 [internal/glance/widget-utils.go#L236-L239](internal/glance/widget-utils.go#L236-L239)
 
 ### 6.3 排序逻辑
 
@@ -837,24 +1015,7 @@ Level 4: HTTP 请求超时         ──── 单次请求 5 秒超时
 
 ### 7.1 Level 1：Page 级 Widget 并发更新
 
-见 [internal/glance/glance.go#L233-L270](internal/glance/glance.go#L233-L270)：
-
-```go
-func (p *page) updateOutdatedWidgets() {
-    var wg sync.WaitGroup
-    // ...
-    for w := range p.HeadWidgets {
-        if !widget.requiresUpdate(&now) { continue }
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            widget.update(context)
-        }()
-    }
-    // Columns 同理
-    wg.Wait()
-}
-```
+见 [internal/glance/glance.go#L233-L270](internal/glance/glance.go#L233-L270)。
 
 **可由代码直接证明的事实：**
 - 一个页面有多少个过期 Widget，就启动多少个 goroutine（代码中无 goroutine 数量上限的主动限制）
@@ -863,13 +1024,13 @@ func (p *page) updateOutdatedWidgets() {
 
 ### 7.2 Level 2：RSS Widget 内部 Worker Pool
 
-Worker Pool 采用泛型实现，定义在 [internal/glance/widget-utils.go#L141-L242](internal/glance/widget-utils.go#L141-L242)。RSS Widget 固定配置 **30 个 Worker**，见 [internal/glance/widget-rss.go#L155-L156](internal/glance/widget-rss.go#L155-L156)：
+Worker Pool 采用泛型实现，完整定义在 [internal/glance/widget-utils.go#L141-L242](internal/glance/widget-utils.go#L141-L242)。RSS Widget 固定配置 **30 个 Worker**，见 [internal/glance/widget-rss.go#L155-L156](internal/glance/widget-rss.go#L155-L156)：
 
 ```go
 job := newJob(widget.fetchItemsFromFeedTask, requests).withWorkers(30)
 ```
 
-核心数据结构（见 [internal/glance/widget-utils.go#L141-L155](internal/glance/widget-utils.go#L141-L155)）：
+核心数据结构，见 [internal/glance/widget-utils.go#L141-L155](internal/glance/widget-utils.go#L141-L155)：
 
 ```go
 type workerPoolTask[I any, O any] struct {
@@ -887,6 +1048,21 @@ type workerPoolJob[I any, O any] struct {
 }
 ```
 
+`newJob()` 初始化时 `workers` 默认值为 `defaultNumWorkers = 10`，见 [internal/glance/widget-utils.go#L155-L182](internal/glance/widget-utils.go#L155-L182)：
+
+```go
+const defaultNumWorkers = 10
+
+func newJob[I any, O any](task func(I) (O, error), data []I) *workerPoolJob[I, O] {
+    return &workerPoolJob[I, O]{
+        workers: defaultNumWorkers,
+        task:    task,
+        data:    data,
+        ctx:     context.Background(),
+    }
+}
+```
+
 `withWorkers()` 会做 `min(workers, len(data))` 裁剪，见 [internal/glance/widget-utils.go#L157-L165](internal/glance/widget-utils.go#L157-L165)：
 
 ```go
@@ -900,26 +1076,79 @@ func (job *workerPoolJob[I, O]) withWorkers(workers int) *workerPoolJob[I, O] {
 }
 ```
 
-`workerPoolDo()` 核心流程见 [internal/glance/widget-utils.go#L184-L242](internal/glance/widget-utils.go#L184-L242)：
-
-```
-主 goroutine → 创建 tasksQueue / resultsQueue
-     │
-     ├─ 启动 N 个 Worker goroutine：for t := range tasksQueue { 执行任务 → resultsQueue }
-     │
-     ├─ 独立 goroutine：遍历输入发 tasksQueue → close(tasksQueue) → wg.Wait() → close(resultsQueue)
-     │
-     └─ 主 goroutine：for task := range resultsQueue { 按 task.index 回填到 results / errs }
-```
-
-**单任务优化**：源数 = 1 时直接同步执行，完全跳过 channel 与 goroutine 开销，见 [internal/glance/widget-utils.go#L192-L195](internal/glance/widget-utils.go#L192-L195)：
+`workerPoolDo()` 完整实现，见 [internal/glance/widget-utils.go#L184-L242](internal/glance/widget-utils.go#L184-L242)：
 
 ```go
-if len(job.data) == 1 {
-    results[0], errs[0] = job.task(job.data[0])
-    return results, errs, nil
+func workerPoolDo[I any, O any](job *workerPoolJob[I, O]) ([]O, []error, error) {
+    results := make([]O, len(job.data))
+    errs := make([]error, len(job.data))
+
+    // 空输入提前返回
+    if len(job.data) == 0 {
+        return results, errs, nil
+    }
+
+    // 单任务优化：源数 = 1 时同步执行，跳过 channel/goroutine 开销
+    if len(job.data) == 1 {
+        results[0], errs[0] = job.task(job.data[0])
+        return results, errs, nil
+    }
+
+    tasksQueue := make(chan *workerPoolTask[I, O])
+    resultsQueue := make(chan *workerPoolTask[I, O])
+
+    var wg sync.WaitGroup
+
+    // 启动 N 个 Worker goroutine
+    for range job.workers {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            for t := range tasksQueue {
+                t.output, t.err = job.task(t.input)
+                resultsQueue <- t
+            }
+        }()
+    }
+
+    var err error
+
+    // 独立 goroutine：发送任务，支持 context 取消
+    go func() {
+    loop:
+        for i := range job.data {
+            select {
+            default:
+                tasksQueue <- &workerPoolTask[I, O]{
+                    index: i,
+                    input: job.data[i],
+                }
+            case <-job.ctx.Done():
+                err = job.ctx.Err()
+                break loop
+            }
+        }
+
+        close(tasksQueue)
+        wg.Wait()
+        close(resultsQueue)
+    }()
+
+    // 主 goroutine：收集结果
+    for task := range resultsQueue {
+        errs[task.index] = task.err
+        results[task.index] = task.output
+    }
+
+    return results, errs, err
 }
 ```
+
+**可由代码直接证明的事实：**
+- 空输入（`len(job.data) == 0`）时提前返回空结果
+- 单任务优化：源数 = 1 时直接同步执行
+- 任务发送使用 `select` + `job.ctx.Done()`，支持 context 取消中断；取消后记录 `err = job.ctx.Err()`
+- 结果按 `task.index` 回填，保证输出顺序与输入顺序一致
 
 ### 7.3 Level 3：HTTP Transport 连接池
 
@@ -937,7 +1166,7 @@ var defaultHTTPClient = &http.Client{
 }
 ```
 
-**本项目代码中显式设置的参数**：
+**本项目代码中显式设置的参数：**
 | 参数 | 显式设置值 | 代码位置 |
 |-----|-----------|---------|
 | `Transport.MaxIdleConnsPerHost` | 10 | [internal/glance/widget-utils.go#L28](internal/glance/widget-utils.go#L28-L28) |
@@ -958,7 +1187,7 @@ var defaultHTTPClient = &http.Client{
 | 层级 | 位置 | 限制值（代码可证） | 控制对象 |
 |-----|------|-------|---------|
 | L1 Page 级 | [internal/glance/glance.go#L233-L270](internal/glance/glance.go#L233-L270) | 无主动上限（page.mu 串行化同 Page 更新） | 同一 Page 内多个 Widget 的并发更新 |
-| L2 Worker Pool | [internal/glance/widget-rss.go#L155-L156](internal/glance/widget-rss.go#L155-L156) | 30 goroutine（实际 `min(30, 源数)`，单源同步优化） | 单个 RSS Widget 内多个源的并发抓取 |
+| L2 Worker Pool | [internal/glance/widget-rss.go#L155-L156](internal/glance/widget-rss.go#L155-L156) | 30 goroutine（实际 `min(30, 源数)`，空/单任务优化） | 单个 RSS Widget 内多个源的并发抓取 |
 | L3 连接池 | [internal/glance/widget-utils.go#L24-L32](internal/glance/widget-utils.go#L24-L32) | 每 Host 10 个空闲连接（显式设置） | TCP 连接复用（HTTP Keep-Alive） |
 | L4 超时 | [internal/glance/widget-utils.go#L24](internal/glance/widget-utils.go#L24-L24) | 5 秒 | 单次 HTTP 请求的最长耗时 |
 
@@ -985,7 +1214,7 @@ Browser → GET /api/pages/{page}/content/
     │      │                │      ├─ job := newJob(fetchItemsFromFeedTask, requests).withWorkers(30)
     │      │                │      └─ workerPoolDo(job)
     │      │                │             │
-    │      │                │             ├─ 单任务优化（len==1 同步执行）或启动 N 个 Worker
+    │      │                │             ├─ len==0 → 空返回 / len==1 → 单任务同步
     │      │                │             │
     │      │                │             ├─ [Worker k] fetchItemsFromFeedTask(requests[k])
     │      │                │             │      ├─ cachedFeedsMutex.Lock()
@@ -994,14 +1223,14 @@ Browser → GET /api/pages/{page}/content/
     │      │                │             │      ├─ cachedFeedsMutex.Unlock()
     │      │                │             │      ├─ 应用用户自定义 Headers
     │      │                │             │      ├─ defaultHTTPClient.Do(req)  (L4: 5s 超时)
+    │      │                │             │      ├─ defer resp.Body.Close()
     │      │                │             │      ├─ 304 Not Modified && isCached?
     │      │                │             │      │    └─ 是 → 直接 return cache.items
     │      │                │             │      ├─ 200 OK?
     │      │                │             │      │    ├─ io.ReadAll(resp.Body) → []byte
     │      │                │             │      │    ├─ feedParser.ParseString()
     │      │                │             │      │    ├─ per-source Limit 裁剪
-    │      │                │             │      │    ├─ 字段映射（ChannelURL/ChannelName/Title/Link/
-    │      │                │             │      │    │              Categories/Description/ImageURL/PublishedAt）
+    │      │                │             │      │    ├─ 字段映射（8 个字段逐一处理）
     │      │                │             │      │    ├─ 响应有 ETag 或 Last-Modified?
     │      │                │             │      │    │    └─ 是 → cachedFeeds[url] = {etag, lastMod, items}
     │      │                │             │      │    └─ return items
@@ -1018,7 +1247,7 @@ Browser → GET /api/pages/{page}/content/
     │      │                │
     │      │                └─ widget.canContinueUpdateAfterHandlingErr(err)
     │      │                     ├─ err == nil
-    │      │                     │    ├─ withError(nil) / withNotice(nil)
+    │      │                     │    ├─ withNotice(nil) / withError(nil)
     │      │                     │    └─ scheduleNextUpdate() → nextUpdate=now+2h, retriedTimes=0
     │      │                     ├─ errors.Is(err, errPartialContent)
     │      │                     │    ├─ withError(nil) / withNotice(err)
@@ -1057,11 +1286,19 @@ Browser → GET /api/pages/{page}/content/
 | RSS 去重逻辑 | [internal/glance/widget-rss.go#L163-L179](internal/glance/widget-rss.go#L163-L179) |
 | RSS 排序逻辑（sort.Slice，不稳定） | [internal/glance/widget-rss.go#L144-L150](internal/glance/widget-rss.go#L144-L150) |
 | gofeed Parser 包级单例初始化 | [internal/glance/widget-rss.go#L29](internal/glance/widget-rss.go#L29-L29) |
-| 字符集读取与 gofeed 调用 | [internal/glance/widget-rss.go#L230-L238](internal/glance/widget-rss.go#L230-L238) |
+| 字符集读取与 gofeed 调用 + defer Body.Close | [internal/glance/widget-rss.go#L192-L238](internal/glance/widget-rss.go#L192-L238) |
 | 单源 Limit 裁剪 | [internal/glance/widget-rss.go#L240-L242](internal/glance/widget-rss.go#L240-L242) |
 | 全局 Limit 裁剪 | [internal/glance/widget-rss.go#L91-L93](internal/glance/widget-rss.go#L91-L93) |
-| 完整字段映射（标题/链接/分类/描述/时间/缩略图） | [internal/glance/widget-rss.go#L249-L330](internal/glance/widget-rss.go#L249-L330) |
+| 完整字段映射（标题/链接/分类/描述/时间/缩略图） | [internal/glance/widget-rss.go#L244-L331](internal/glance/widget-rss.go#L244-L331) |
+| 缩略图递归查找扩展节点 | [internal/glance/widget-rss.go#L346-L374](internal/glance/widget-rss.go#L346-L374) |
 | HTML 标签剥离与描述清理 | [internal/glance/widget-rss.go#L376-L402](internal/glance/widget-rss.go#L376-L402) |
 | RSS 30 Worker 配置 | [internal/glance/widget-rss.go#L155-L156](internal/glance/widget-rss.go#L155-L156) |
 | HTTP 连接池与超时配置 | [internal/glance/widget-utils.go#L24-L32](internal/glance/widget-utils.go#L24-L32) |
-| Worker Pool 泛型实现（含单任务优化） | [internal/glance/widget-utils.go#L141-L242](internal/glance/widget-utils.go#L141-L242) |
+| Worker Pool 泛型实现（含空输入/单任务/context 取消） | [internal/glance/widget-utils.go#L141-L242](internal/glance/widget-utils.go#L141-L242) |
+| withError 实际实现（仅 ContentAvailable=true + 无条件 Error 赋值） | [internal/glance/widget.go#L283-L291](internal/glance/widget.go#L283-L291) |
+| renderTemplate（ContentAvailable=false 设置点） | [internal/glance/widget.go#L217-L241](internal/glance/widget.go#L217-L241) |
+| widgetBase 完整结构体定义 | [internal/glance/widget.go#L149-L167](internal/glance/widget.go#L149-L167) |
+| canContinueUpdateAfterHandlingErr（错误分级与调度分支） | [internal/glance/widget.go#L293-L325](internal/glance/widget.go#L293-L325) |
+| RSS Widget Render() 模板选择 | [internal/glance/widget-rss.go#L98-L112](internal/glance/widget-rss.go#L98-L112) |
+| RSS Widget initialize() 默认值设置 | [internal/glance/widget-rss.go#L49-L78](internal/glance/widget-rss.go#L49-L78) |
+| RSS Widget update() 主流程 | [internal/glance/widget-rss.go#L80-L96](internal/glance/widget-rss.go#L80-L96) |
