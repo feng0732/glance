@@ -84,15 +84,153 @@ func (widget *monitorWidget) initialize() error {
 ```
 参考 [widget-monitor.go#L37-L41](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget-monitor.go#L37-L41)
 
-### 2.2 缓存调度机制
+### 2.2 刷新调度机制总览
 
-缓存调度由 `widgetBase` 基类统一管理，涉及以下关键方法：
+刷新调度是整个 Widget 体系中最容易产生误解的部分。整个调度链路横跨三层：HTTP 请求层 → Page 层 → Widget 层。
 
-- [requiresUpdate()](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget.go#L173-L183)：判断是否需要执行更新
-- [scheduleNextUpdate()](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget.go#L343-L348)：成功时按正常周期调度
-- [scheduleEarlyUpdate()](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget.go#L350-L367)：失败时采用**指数退避**策略重试
+#### 2.2.1 整体调度框架
 
-指数退避算法：重试间隔 = `retryCount²` 分钟，最大重试次数为 5，即最长间隔为 25 分钟，但不超过正常缓存周期。
+**触发入口**：浏览器加载页面时会请求 `/api/pages/{page}/content/`，由 [handlePageContentRequest()](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/glance.go#L334-L367) 处理：
+
+```go
+func (a *application) handlePageContentRequest(w http.ResponseWriter, r *http.Request) {
+    // ...
+    func() {
+        page.mu.Lock()
+        defer page.mu.Unlock()
+        page.updateOutdatedWidgets()   // ← 核心调度入口
+        err = pageContentTemplate.Execute(&responseBytes, pageData)
+    }()
+}
+```
+
+注意：刷新是**由页面访问驱动的被动刷新**，没有后台定时器主动刷新。如果 1 小时内没人访问页面，Widget 的数据也不会更新。
+
+#### 2.2.2 Page 层调度：updateOutdatedWidgets()
+
+[page.updateOutdatedWidgets()](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/glance.go#L233-L270) 遍历该页面所有 Widget，决定哪些需要更新：
+
+```go
+func (p *page) updateOutdatedWidgets() {
+    now := time.Now()
+    var wg sync.WaitGroup
+    ctx := context.Background()
+
+    for w := range p.HeadWidgets {
+        widget := p.HeadWidgets[w]
+        if !widget.requiresUpdate(&now) {   // ← 判定是否需要更新
+            continue
+        }
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            widget.update(ctx)   // ← 每个需更新的 Widget 在独立 goroutine 中执行
+        }()
+    }
+    // Columns 中的 Widget 同理
+    wg.Wait()
+}
+```
+
+关键点：
+- 多个过期 Widget 会**并发**执行 update
+- 同一个页面的 Widget 共享 `page.mu` 全局锁，保证渲染时数据一致性
+- 传入的 `context` 是 `context.Background()`，永不超时、永不取消
+
+#### 2.2.3 是否需要更新的判定：requiresUpdate()
+
+[widgetBase.requiresUpdate()](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget.go#L173-L183) 逻辑极为简单：
+
+```go
+func (w *widgetBase) requiresUpdate(now *time.Time) bool {
+    if w.cacheType == cacheTypeInfinite {
+        return false
+    }
+    if w.nextUpdate.IsZero() {   // 首次运行，nextUpdate 未设置
+        return true
+    }
+    return now.After(w.nextUpdate)   // 当前时间是否晚于计划更新时间
+}
+```
+
+Monitor Widget 的 `cacheType` 为 `cacheTypeDuration`，缓存 5 分钟，因此每 5 分钟（或首次访问）会触发一次更新。
+
+#### 2.2.4 调度决策核心：canContinueUpdateAfterHandlingErr()
+
+[widgetBase.canContinueUpdateAfterHandlingErr()](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget.go#L293-L325) 是所有 Widget 共用的调度决策枢纽。它接收 update 过程中产生的 error，同时完成三件事：
+1. 设置 Widget 级错误/提示状态（`Error` vs `Notice`）
+2. 决定是否继续处理本次已获取的数据
+3. 调度下一次更新的时间
+
+完整决策树：
+
+```
+canContinueUpdateAfterHandlingErr(err)
+         │
+         ▼
+    err == nil?
+         │
+         ├── 是（无错误）
+         │     ├── withNotice(nil)        清除提示
+         │     ├── withError(nil)         清除错误
+         │     ├── scheduleNextUpdate()   正常周期刷新
+         │     └── return true            继续处理数据
+         │
+         └── 否（有错误）
+               ├── scheduleEarlyUpdate()  指数退避加速重试
+               │
+               └── err == errPartialContent?
+                     │
+                     ├── 是（部分内容获取失败）
+                     │     ├── withError(nil)     不标记整体错误
+                     │     ├── withNotice(err)    标记为提示（黄色警告）
+                     │     └── return true        继续处理已获取的数据
+                     │
+                     └── 否（完全失败）
+                           ├── withError(err)     标记整体错误（红色错误）
+                           ├── withNotice(nil)    无提示
+                           └── return false       中止后续处理
+```
+
+#### 2.2.5 两种调度策略的算法
+
+**正常调度 scheduleNextUpdate()** [widget.go#L343-L348](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget.go#L343-L348)：
+```go
+func (w *widgetBase) scheduleNextUpdate() *widgetBase {
+    w.nextUpdate = w.getNextUpdateTime()   // now + cacheDuration
+    w.updateRetriedTimes = 0                // 重置退避计数器
+    return w
+}
+```
+
+**退避调度 scheduleEarlyUpdate()** [widget.go#L350-L367](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget.go#L350-L367)：
+```go
+func (w *widgetBase) scheduleEarlyUpdate() *widgetBase {
+    w.updateRetriedTimes++
+    if w.updateRetriedTimes > 5 {
+        w.updateRetriedTimes = 5          // 计数器上限 5
+    }
+    // 指数退避：1²=1分钟, 2²=4分钟, 3²=9分钟, 4²=16分钟, 5²=25分钟
+    nextEarlyUpdate := time.Now().Add(
+        time.Duration(math.Pow(float64(w.updateRetriedTimes), 2)) * time.Minute)
+    nextUsualUpdate := w.getNextUpdateTime()
+
+    // 取更早的那个时间点
+    if nextEarlyUpdate.After(nextUsualUpdate) {
+        w.nextUpdate = nextUsualUpdate    // 退避到 25 分钟时不会超过正常 5 分钟周期
+    } else {
+        w.nextUpdate = nextEarlyUpdate    // 连续失败时：1分钟 → 4分钟 → 5分钟（被正常周期截断）
+    }
+    return w
+}
+```
+
+对 Monitor Widget（正常周期 5 分钟）而言，实际退避序列为：
+- 第 1 次失败：1 分钟后重试
+- 第 2 次失败：4 分钟后重试
+- 第 3 次及以后：5 分钟后重试（因 9 分钟 > 正常 5 分钟，被截断）
+
+`updateRetriedTimes` 计数器**只在 scheduleNextUpdate() 时重置**，即只有一次完全成功的更新才能清零退避计数。
 
 ---
 
@@ -546,36 +684,91 @@ if status.Error != nil && site.ErrorURL != "" {
 
 ---
 
-### 10.3 刷新调度的真实触发逻辑
+### 10.3 刷新调度深度解析：探活失败会触发提前重试吗？
 
-刷新调度由 [canContinueUpdateAfterHandlingErr()](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget.go#L293-L325) 控制，但这里存在一个极易误解的点：
+这是最容易产生误解的问题。简短答案是：**不会**。被监控的站点无论超时、DNS 失败还是返回 500，都不会启动指数退避机制。以下是完整的推导过程。
 
-#### 调度决策路径
+#### 10.3.1 Error 的三层传递模型
 
-```
-fetchStatusForSites(requests)
-        │
-        ▼
-  返回 (results, err)
-        │
-        ▼
-  canContinueUpdateAfterHandlingErr(err)
-        │
-        ├── err == nil  → scheduleNextUpdate()   正常5分钟后刷新
-        └── err != nil  → scheduleEarlyUpdate()  指数退避重试
-```
-
-#### 关键问题：`fetchStatusForSites` 什么时候返回 err？
-
-追踪调用链：
+Monitor Widget 中存在三个完全独立的 error 通道，各自语义不同，绝不能混淆：
 
 ```
-fetchStatusForSites()
-  → workerPoolDo(job)         返回 (results, errs, err)
-     → 只有 job.ctx.Done() 触发时，第三个返回值 err 才非 nil
+┌─────────────────────────────────────────────────────────────────┐
+│  层级 1：站点级错误 (siteStatus.Error)                           │
+│  ┌─────────┐  ┌─────────┐      ┌─────────┐                     │
+│  │站点 A   │  │站点 B   │ ...  │站点 N   │                     │
+│  │Error: nil│  │Error: DNSError │  │Error: nil│                     │
+│  └────┬────┘  └────┬────┘      └────┬────┘                     │
+│       │            │                │                           │
+│       └────────────┴──────┬─────────┘                           │
+│                           ▼                                     │
+│                  每个站点独立处理，                              │
+│                  用于单站状态展示、ErrorURL 跳转                 │
+│                  不向上冒泡                                      │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  层级 2：Worker Pool 级错误 (workerPoolDo 第三个返回值)          │
+│                                                                 │
+│  workerPoolDo() 返回 (results, errs, err)                       │
+│                              │                                   │
+│                              ├── results: []siteStatus          │
+│                              │   (含各自的站点级 Error)          │
+│                              │                                   │
+│                              ├── errs: []error (被忽略!)         │
+│                              │   fetchSiteStatusTask 的第二个    │
+│                              │   返回值，Monitor 中始终为 nil   │
+│                              │                                   │
+│                              └── err: error                      │
+│                                  仅 job.ctx.Done() 触发          │
+│                                  Monitor 中始终为 nil            │
+│                                                                 │
+│  这是传给 canContinueUpdateAfterHandlingErr 的 err               │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  层级 3：Widget 级错误 (widgetBase.Error / widgetBase.Notice)   │
+│                                                                 │
+│  由 canContinueUpdateAfterHandlingErr 根据层级 2 的 err 设置     │
+│  影响整个 Widget 的头部错误提示和渲染分支                        │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-位置：[widget-utils.go#L214-L234](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget-utils.go#L214-L234)
+**关键发现**：层级 1 的站点级错误被完全"吸收"在 `results` 数组内部，永远不会变成层级 2 的 err，因此永远不会到达层级 3 的调度决策器。
+
+#### 10.3.2 与其他 Widget 的对比：为什么 RSS 会退避而 Monitor 不会？
+
+Glance 中的 Widget 分为两种错误处理范式：
+
+**范式 A：整体失败型**（Weather、Custom-API 等单源 Widget）
+```go
+// widget-weather.go
+weather, err := fetchWeatherForOpenMeteoPlace(...)
+if !widget.canContinueUpdateAfterHandlingErr(err) {
+    return   // err != nil → 整体失败，触发退避
+}
+```
+- 数据源单一，失败就意味着整个 Widget 没有内容
+- `err != nil` 会被直接传给调度器 → 触发 `scheduleEarlyUpdate()`
+
+**范式 B：部分失败型**（RSS、Videos、Twitch、Markets、Monitor 等多源 Widget）
+
+这些 Widget 的特点是：多个数据源中部分失败是常态，不应该因为一个源挂了就退避整个 Widget。但它们在实现上分为两派：
+
+| Widget | 多源失败时返回的 err | 调度行为 |
+|--------|---------------------|----------|
+| RSS/Videos/Twitch/Markets | `fmt.Errorf("%w: missing %d feeds", errPartialContent, failed)` | **触发退避**（scheduleEarlyUpdate），但 return true 继续展示已有数据 |
+| **Monitor** | **nil** | **不触发退避**，正常 5 分钟调度 |
+
+Monitor 是多源 Widget 中**唯一不使用 errPartialContent** 的。原因在于设计语义不同：
+- RSS/Videos 等：失败的源意味着"内容缺失"，可能是临时网络波动，值得加速重试补全
+- Monitor：站点失败正是 Widget 需要展示的**正常业务状态**，不是"数据获取异常"。所有站点都挂了也是合法的监控结果，Widget 的内容完整无缺
+
+#### 10.3.3 workerPoolDo 中 err 的赋值路径
+
+[workerPoolDo()](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget-utils.go#L184-L242) 返回的第三个 error 有且仅有一个赋值点：
 
 ```go
 var err error
@@ -590,32 +783,95 @@ loop:
             break loop
         }
     }
-    ...
+    close(tasksQueue)
+    wg.Wait()
+    close(resultsQueue)
 }()
 ```
 
-而 `newJob()` 创建 job 时使用的是 `context.Background()`：
+而 Monitor 调用链中的 job 创建于 [newJob()](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget-utils.go#L175-L182)：
 
 ```go
 func newJob[I any, O any](task func(I) (O, error), data []I) *workerPoolJob[I, O] {
     return &workerPoolJob[I, O]{
-        ...
-        ctx: context.Background(),   // ← 永不取消的 context
+        workers: defaultNumWorkers,
+        task:    task,
+        data:    data,
+        ctx:     context.Background(),   // ← 永不超时、永不取消
     }
 }
 ```
 
-#### 结论
+虽然 `workerPoolJob` 预留了 `withContext()` 方法（当前被注释掉），但 Monitor Widget 没有传入自定义 context。因此 `job.ctx.Done()` 永远不会触发，`workerPoolDo` 的第三个返回值永远是 `nil`。
 
-| 故障场景 | `fetchStatusForSites` 返回 err | 调度行为 |
-|----------|-------------------------------|----------|
-| 单个站点超时 | **否** | 正常 5 分钟刷新 |
-| 单个站点 DNS 失败 | **否** | 正常 5 分钟刷新 |
-| 单个站点返回 500 | **否** | 正常 5 分钟刷新 |
-| 所有站点全部超时 | **否** | 正常 5 分钟刷新 |
-| Worker Pool context 被取消（极罕见） | **是** | 指数退避重试 |
+此外，`fetchSiteStatusTask` 的签名是 `func(...) (siteStatus, error)`，它**永远把 error 放在第一个返回值的 Error 字段中，第二个返回值始终为 nil**。即使某个站点探测完全失败，`workerPoolDo` 返回的 `errs`（第二个返回值）切片中也全是 nil，而 Monitor 在 `fetchStatusForSites` 中直接丢弃了这个返回值：
 
-**设计要点**：Monitor Widget 采用的是"**结果内聚错误**"模型——每个站点的错误存储在各自 `siteStatus.Error` 中，由上层 UI 逐站展示；Worker Pool 层面的错误（即 `fetchStatusForSites` 返回的 err）仅用于表示"整个调度框架出了问题"，而非"被监控站点出了问题"。因此**被监控的站点故障永远不会触发 early update**，始终按 5 分钟正常周期刷新。
+```go
+results, _, err := workerPoolDo(job)   // ← 第二个返回值被下划线忽略
+```
+
+#### 10.3.4 退避机制真正启动的充要条件
+
+对 Monitor Widget 而言，要让 `scheduleEarlyUpdate()` 被调用，需要**同时满足**以下条件：
+
+| # | 条件 | Monitor 中是否可能 |
+|---|------|-------------------|
+| 1 | `fetchStatusForSites` 返回的 err != nil | 几乎不可能（需修改源码传入可取消的 context） |
+| 2 | 该 err 被传入 `canContinueUpdateAfterHandlingErr` | 依赖条件 1 |
+| 3 | 页面被用户访问，触发 `updateOutdatedWidgets` | 是（被动刷新的前提） |
+| 4 | `widget.requiresUpdate()` 返回 true | 是（到达计划更新时间） |
+
+**结论**：在不修改源码的情况下，Monitor Widget 的指数退避机制是**死代码**。无论监控多少个站点、它们失败得多么彻底，Widget 始终按 `scheduleNextUpdate()` 的 5 分钟周期执行。
+
+#### 10.3.5 完整时间线示例
+
+假设一个 Monitor Widget 监控 3 个站点，配置缓存 5 分钟。站点 A 在 T=0 后宕机：
+
+```
+T=0min   用户首次访问页面
+         → requiresUpdate() 返回 true (nextUpdate 为零值)
+         → update() 执行：A=200, B=200, C=200
+         → canContinueUpdateAfterHandlingErr(nil)
+         → scheduleNextUpdate() → nextUpdate = T+5min
+         → updateRetriedTimes = 0
+
+T=3min   用户访问（未到 5 分钟）
+         → requiresUpdate() 返回 false
+         → 使用缓存渲染，不执行 update()
+
+T=5min   用户访问
+         → requiresUpdate() 返回 true
+         → update() 执行：A=DNS 失败, B=200, C=200
+         → fetchStatusForSites 返回 err=nil
+         → canContinueUpdateAfterHandlingErr(nil)
+         → scheduleNextUpdate() → nextUpdate = T+10min
+         → updateRetriedTimes 保持 0 (无退避)
+
+T=6min   用户访问
+         → requiresUpdate() 返回 false
+
+T=10min  用户访问
+         → update() 执行：A=DNS 失败, B=200, C=502
+         → err 仍为 nil
+         → scheduleNextUpdate() → nextUpdate = T+15min
+         → updateRetriedTimes 仍为 0
+
+T=15min  A 恢复，update() 执行：A=200, B=200, C=200
+         → 与失败时调度无差异，仍是 5 分钟周期
+```
+
+即使 A 连续宕机数小时，更新间隔也始终是 5 分钟，`updateRetriedTimes` 永远停留在 0，退避算法的 `math.Pow(..., 2)` 计算永不执行。
+
+#### 10.3.6 Widget 级错误状态 vs 单站状态
+
+需要特别区分两个完全独立的错误概念：
+
+| 概念 | 存储位置 | 触发条件 | UI 表现 |
+|------|---------|---------|--------|
+| **Widget 级错误** | `widgetBase.Error` | `canContinueUpdateAfterHandlingErr` 收到非 errPartialContent 的错误 | Widget 头部显示红色错误条，覆盖整个内容区 |
+| **单站状态异常** | `site[i].Status.Error` + `site[i].Status.Code` | 单站探测失败或 HTTP>=400 | 仅该站点显示红色状态图标和文本 |
+
+Monitor Widget 在正常运行中只会出现单站异常，Widget 级错误永远不会被设置（除非 Worker Pool 框架本身出问题）。而 RSS Widget 在部分源失败时会出现 Widget 级 Notice（黄色提示），整体错误时出现 Widget 级 Error。
 
 ---
 
