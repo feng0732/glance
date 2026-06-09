@@ -24,9 +24,9 @@ widget.requiresUpdate(now)  [widget.go#L173-L183]
          数据获取（可能嵌套 Singleflight）
               ↓
          canContinueUpdateAfterHandlingErr(err)  [widget.go#L293-L325]
-              ├─ 成功 → scheduleNextUpdate()        正常 TTL
-              ├─ 部分成功 → scheduleEarlyUpdate()   指数退避短 TTL
-              └─ 完全失败 → scheduleEarlyUpdate()   指数退避短 TTL
+              ├─ 成功(err=nil) → withError(nil) 置 ContentAvailable=true, scheduleNextUpdate(), return true → 覆盖数据字段
+              ├─ 部分成功(errPartialContent) → withNotice(err), scheduleEarlyUpdate(), return true → 覆盖部分数据
+              └─ 完全失败(errNoContent) → withError(err) 不碰 ContentAvailable, scheduleEarlyUpdate(), return false → 不覆盖数据(保留旧值)
 ```
 
 ---
@@ -181,22 +181,164 @@ func (w *widgetBase) requiresUpdate(now *time.Time) bool {
 
 ---
 
-## 五、失败短缓存（指数退避重试）
+## 五、失败短缓存、内容保留与错误提示的协作
 
-当数据获取失败时，系统不会等待完整 TTL，而是采用**指数退避（Exponential Backoff）** 策略调度更短的重试间隔。
+这是整个缓存系统最精巧、最容易误解的部分。三个核心机制互相配合：
+1. `withError()` / `withNotice()` — 设置状态标记
+2. `canContinueUpdateAfterHandlingErr()` 的返回值 — 控制是否覆盖旧数据
+3. `widget-base.html` 模板 — 根据状态决定渲染方式
 
-### 5.1 统一错误处理入口
+### 5.1 三个关键状态字段
 
-所有 Widget 的 `update()` 方法都通过 `canContinueUpdateAfterHandlingErr(err)` 处理结果，定义于 [widget.go#L293-L325](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget.go#L293-L325)。
+每个 Widget 实例维护三个状态位（定义于 [widget.go#L149-L167](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget.go#L149-L167)）：
 
-错误分两个等级（定义于 [widget-utils.go#L20-L21](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-utils.go#L20-L21)）：
+| 字段 | 类型 | 含义 |
+|------|------|------|
+| `ContentAvailable` | `bool` | 是否有**可展示的内容**。这是决定渲染"内容"还是"错误页"的总开关 |
+| `Error` | `error` | 严重错误。仅当 `ContentAvailable=true` 时以图标形式展示 |
+| `Notice` | `error` | 轻微提示（部分数据缺失）。以黄色小图标展示 |
 
-| 错误类型 | 含义 | 处理方式 |
-|---------|------|---------|
-| `errNoContent` | 完全获取失败 | 设置 `widget.Error`，显示错误，**不保留旧内容** |
-| `errPartialContent` | 部分资源失败 | 设置 `widget.Notice`，**保留已获取内容**继续渲染 |
+### 5.2 withError 的微妙逻辑
 
-### 5.2 scheduleEarlyUpdate 退避算法
+`withError()` 定义于 [widget.go#L283-L291](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget.go#L283-L291)：
+
+```go
+func (w *widgetBase) withError(err error) *widgetBase {
+    if err == nil && !w.ContentAvailable {
+        w.ContentAvailable = true        // ← 只有"成功且之前没内容"时才置为 true
+    }
+    w.Error = err                        // ← err != nil 时只赋值 Error，不动 ContentAvailable
+    return w
+}
+```
+
+**关键洞察**：当 `err != nil` 时，`withError()` **绝对不会修改 `ContentAvailable`**。它既不会把 `true` 改成 `false`，也不会把 `false` 改成 `true`。这是"旧内容不被丢弃"的第一道防线。
+
+### 5.3 canContinueUpdateAfterHandlingErr 的返回值决定数据是否被覆盖
+
+完整逻辑在 [widget.go#L293-L325](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget.go#L293-L325)：
+
+```go
+func (w *widgetBase) canContinueUpdateAfterHandlingErr(err error) bool {
+    if err != nil {
+        w.scheduleEarlyUpdate()                    // ① 无论何种失败，都触发退避重试
+
+        if !errors.Is(err, errPartialContent) {
+            w.withError(err)                       // ② 设置 Error（不碰 ContentAvailable）
+            w.withNotice(nil)
+            return false                           // ③ ⚠ 返回 false：调用方不会覆盖数据字段
+        }
+
+        // errPartialContent 分支
+        w.withError(nil)                           // ②' 清 Error，如无内容则把 ContentAvailable 置 true
+        w.withNotice(err)                          // ②' 设置 Notice 提示
+        return true                                // ③' ⚠ 返回 true：调用方会用部分数据覆盖字段
+    }
+
+    // 成功分支
+    w.withNotice(nil)
+    w.withError(nil)                               // 清除 Error，如无内容则把 ContentAvailable 置 true
+    w.scheduleNextUpdate()                         // 正常 TTL，重置退避计数
+    return true
+}
+```
+
+`return false` 的真实含义是：**中止本次 update，不要把新获取的（可能为空的）数据写入 Widget 字段**。因为一旦 `widget.Videos = nil` 或 `widget.Posts = nil` 执行了，之前的旧数据就被覆盖丢失了。
+
+看一个典型 Widget 调用（以 videos 为例，[widget-videos.go#L66-L78](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-videos.go#L66-L78)）：
+
+```go
+func (widget *videosWidget) update(ctx context.Context) {
+    videos, err := fetchYoutubeChannelUploads(...)
+
+    if !widget.canContinueUpdateAfterHandlingErr(err) {
+        return                                    // ← 提前 return，下一行不会执行
+    }                                             //    旧的 widget.Videos 原封不动
+
+    if len(videos) > widget.Limit {
+        videos = videos[:widget.Limit]
+    }
+    widget.Videos = videos                        // ← 只有成功/部分成功才走到这里覆盖数据
+}
+```
+
+### 5.4 模板渲染：两种错误呈现
+
+模板 [widget-base.html](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/templates/widget-base.html) 用两种截然不同的方式展示错误：
+
+**分支 A：`ContentAvailable = true`（有旧内容可展示）**
+
+```html
+{{- if and .Error .ContentAvailable }}
+<div class="notice-icon notice-icon-major" title="{{ .Error }}"></div>  <!-- 右上角红色小图标 -->
+{{- else if .Notice }}
+<div class="notice-icon notice-icon-minor" title="{{ .Notice }}"></div> <!-- 右上角黄色小图标 -->
+{{- end }}
+...
+{{- if .ContentAvailable }}
+{{ block "widget-content" . }}{{ end }}      <!-- ← 正常渲染旧内容 -->
+```
+
+效果：内容区域照常显示上一次成功的数据，Header 右上角多一个 ⚠️ 图标，鼠标悬浮可看错误信息。用户感知是"数据有点旧，但还能用"。
+
+**分支 B：`ContentAvailable = false`（从未成功过，无内容可展示）**
+
+```html
+{{- else }}
+    <div class="widget-error-header">
+        <div class="color-negative size-h3">ERROR</div>
+        <svg class="widget-error-icon">...</svg>
+    </div>
+    <p class="break-all">{{ if .Error }}{{ .Error }}{{ else }}No error information provided{{ end }}</p>
+{{- end}}
+```
+
+效果：整个 Widget 区域渲染为一个大错误面板，带红色大图标和完整错误文本。
+
+### 5.5 三种失败场景对比
+
+下面用状态机形式说明各字段如何变化：
+
+#### 场景一：首次加载完全失败（ContentAvailable=false）
+
+| 步骤 | 操作 | ContentAvailable | Error | Notice | 数据字段 | nextUpdate |
+|------|------|-----------------|-------|--------|---------|------------|
+| 初始 | - | false | nil | nil | nil | 零值 |
+| fetch 返回 errNoContent | - | false | nil | nil | nil | 零值 |
+| scheduleEarlyUpdate | - | false | nil | nil | nil | now + 1min |
+| withError(err) | 只赋值 Error | **false** | err | nil | nil | now + 1min |
+| return false | 不覆盖数据 | false | err | nil | **nil（保持）** | now + 1min |
+| 渲染 | - | false | err | nil | nil | now + 1min |
+
+**呈现**：大 ERROR 页面，完整错误信息。
+
+#### 场景二：已有内容，后续刷新完全失败（ContentAvailable=true）
+
+| 步骤 | 操作 | ContentAvailable | Error | Notice | 数据字段 | nextUpdate |
+|------|------|-----------------|-------|--------|---------|------------|
+| 初始 | 上次成功 | **true** | nil | nil | [旧视频列表] | now+1h |
+| fetch 返回 errNoContent | - | true | nil | nil | [旧视频列表] | now+1h |
+| scheduleEarlyUpdate | - | true | nil | nil | [旧视频列表] | now+1min |
+| withError(err) | 只赋值 Error，不动 ContentAvailable | **true** | err | nil | [旧视频列表] | now+1min |
+| return false | 不覆盖数据 | true | err | nil | **[旧视频列表]（保持不变）** | now+1min |
+| 渲染 | - | true | err | nil | [旧视频列表] | now+1min |
+
+**呈现**：正常渲染旧的视频列表内容，Header 右上角红色小图标显示错误。
+
+#### 场景三：部分失败（errPartialContent，如 RSS 10 个源有 2 个失败）
+
+| 步骤 | 操作 | ContentAvailable | Error | Notice | 数据字段 | nextUpdate |
+|------|------|-----------------|-------|--------|---------|------------|
+| 初始 | 首次/后续 | false 或 true | nil | nil | nil/旧数据 | - |
+| fetch 返回 8 条成功 + errPartialContent | - | - | nil | nil | [部分数据] | - |
+| scheduleEarlyUpdate | - | - | nil | nil | [部分数据] | now+1min |
+| withError(nil) | 清除 Error，如之前无内容则置 ContentAvailable=true | **true** | nil | nil | [部分数据] | now+1min |
+| withNotice(err) | 设置 Notice | true | nil | err | [部分数据] | now+1min |
+| return true | 允许覆盖数据 | true | nil | err | **[部分数据（覆盖旧值）]** | now+1min |
+
+**呈现**：渲染已成功获取的 8 条内容，Header 右上角黄色小图标提示"部分源失败"。
+
+### 5.6 scheduleEarlyUpdate 退避算法
 
 [widget.go#L350-L367](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget.go#L350-L367)：
 
@@ -225,15 +367,41 @@ func (w *widgetBase) scheduleEarlyUpdate() *widgetBase {
 
 重试间隔序列：
 
-| 失败次数 | 退避间隔 | 累计等待 |
-|---------|---------|---------|
-| 第 1 次 | 1² = 1 分钟 | 1 分钟 |
-| 第 2 次 | 2² = 4 分钟 | 5 分钟 |
-| 第 3 次 | 3² = 9 分钟 | 14 分钟 |
-| 第 4 次 | 4² = 16 分钟 | 30 分钟 |
-| 第 5 次+ | 5² = 25 分钟 | 封顶 25 分钟 |
+| 连续失败次数 | 退避间隔 | 说明 |
+|------------|---------|------|
+| 第 1 次 | 1² = 1 分钟 | 快速重试 |
+| 第 2 次 | 2² = 4 分钟 | - |
+| 第 3 次 | 3² = 9 分钟 | - |
+| 第 4 次 | 4² = 16 分钟 | - |
+| 第 5 次及以后 | 5² = 25 分钟（封顶） | 不再继续拉长 |
+
+注意：退避时间与正常 TTL 取较小值。例如一个 TTL=5 分钟的 Widget，第 3 次失败后不会等 9 分钟，而是等正常的 5 分钟。
 
 成功后通过 `scheduleNextUpdate()` [widget.go#L343-L348](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget.go#L343-L348) 将 `updateRetriedTimes` 重置为 0。
+
+### 5.7 对重试边界的影响
+
+上述机制直接影响"何时会再次触发 update"，形成了以下行为边界：
+
+**边界 1：首次加载永远重试激进**
+- 首次失败时 `nextUpdate.IsZero()` 为 true → `requiresUpdate()` 直接返回 true
+- 但一旦调用了 `scheduleEarlyUpdate()`，`nextUpdate` 就被设为 now+1min，之后 1 分钟内即使有新请求也不会重试
+- 配合 `page.mu`，同一页面不会有两个并发刷新同时进行
+
+**边界 2：有旧内容时，失败不会引发更激进的重试（和无内容时退避完全一样）**
+- 无论 `ContentAvailable` 是 true 还是 false，指数退避的公式完全相同
+- 有旧内容只是**展示层**降级（显示旧数据），**调度层**不受优待或歧视
+- 这意味着：用户看到旧内容的同时，后台在按 1→4→9→16→25 分钟的节奏默默重试
+
+**边界 3：部分成功会中断"连续失败"计数吗？不会**
+- `errPartialContent` 同样走 `scheduleEarlyUpdate()`，退避计数仍然累加
+- 只有**完全成功**（`err == nil`）时才会调用 `scheduleNextUpdate()` 将 `updateRetriedTimes` 归零
+- 这是一个保守策略：只要不是完美成功，就继续保持警惕
+
+**边界 4：return false 保护了数据，但也意味着 Widget 的业务字段永远不会被"清空"**
+- 一旦某个 Widget 曾经成功过（`ContentAvailable=true`），即使 API 持续返回失败，它的 `widget.Posts`、`widget.Videos` 等字段将永久保留最后一次成功的数据
+- 只有重启进程（内存丢失）或调用方手动置空才会清除
+- 这属于"宁可显示旧数据也不显示空白"的设计哲学
 
 ---
 
@@ -323,12 +491,29 @@ fetchItemsFromFeeds() ── workerPoolDo(30 workers) ──► 并发 fetchItem
         ▼
 canContinueUpdateAfterHandlingErr(err)
         │
-        ├─ err == nil ──────────────────► scheduleNextUpdate()  → nextUpdate = now + 2h, retried=0
-        ├─ errors.Is(err, errPartialContent) → scheduleEarlyUpdate() → nextUpdate = now + 1²~25min, 设置 Notice
-        └─ errors.Is(err, errNoContent)    → scheduleEarlyUpdate() → nextUpdate = now + 1²~25min, 设置 Error
+        ├─ err == nil
+        │     ├─ withError(nil): 如 ContentAvailable=false 则置为 true
+        │     ├─ scheduleNextUpdate(): nextUpdate = now + 2h, retried=0
+        │     └─ return true → 后续赋值 widget.Items = 新数据
+        │
+        ├─ errors.Is(err, errPartialContent)
+        │     ├─ scheduleEarlyUpdate(): nextUpdate = now + retryCount² min
+        │     ├─ withError(nil) + withNotice(err)
+        │     └─ return true → 后续赋值 widget.Items = 部分数据
+        │
+        └─ errors.Is(err, errNoContent)
+              ├─ scheduleEarlyUpdate(): nextUpdate = now + retryCount² min
+              ├─ withError(err): 只赋值 Error, 不碰 ContentAvailable
+              └─ return false → 提前 return, widget.Items 保持旧值不变
         │
         ▼
-渲染模板，返回响应，释放 page.mu
+widget-base.html 模板渲染
+        │
+        ├─ ContentAvailable=true  → 渲染内容 + Header 图标(Error=红/Notice=黄)
+        └─ ContentAvailable=false → 渲染大 ERROR 面板
+        │
+        ▼
+返回响应，释放 page.mu
 ```
 
 ---
@@ -346,3 +531,5 @@ canContinueUpdateAfterHandlingErr(err)
 | [widget-rss.go](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-rss.go) | ETag/Last-Modified 二级缓存示例 |
 | [widget-reddit.go](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-reddit.go) | Singleflight + 本地缓存组合示例 |
 | [widget-weather.go](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-weather.go) | OnTheHour 整点缓存示例 |
+| [widget-base.html](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/templates/widget-base.html) | 模板层错误/Notice 两种呈现逻辑 |
+| [widget-videos.go](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-videos.go) | 典型 update() 模式：return false 阻止覆盖旧数据 |
