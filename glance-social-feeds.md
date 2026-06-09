@@ -355,27 +355,37 @@ Engagement = (CommentCount / averageComments + Score / averageScore) / 2
 
 **⚠️ 除零边界：平均评论/分数为 0 时的行为**
 
-代码没有对 `averageComments == 0` 或 `averageScore == 0` 做任何保护，直接进行 float64 除法。Go 语言中浮点数除零的行为：
+代码没有对 `averageComments == 0` 或 `averageScore == 0` 做任何保护，直接进行 float64 除法。
 
-- `正数 / +0.0` → `+Inf`（正无穷）
-- `0.0 / 0.0` → `NaN`（Not a Number）
+**核心前提：CommentCount 和 Score 是非负整数。** 这两个字段分别来自 API 返回的评论数和得分，不可能为负。因此推导如下：
 
-具体到 engagement 公式：
+```
+averageComments = totalComments / numberOfPosts
+averageComments == 0
+    ⟺ totalComments == 0（numberOfPosts ≥ 1）
+    ⟺ 所有帖子的 CommentCount == 0（非负整数之和为 0 ⟹ 每一项都为 0）
+```
 
-| 场景 | CommentCount / AvgComments | Score / AvgScore | Engagement 结果 |
-|------|---------------------------|-----------------|----------------|
-| 所有帖评论=0，所有帖分数=0 | 0/0 = NaN | 0/0 = NaN | **NaN** |
-| 所有帖评论=0，某帖分数>0，其余=0 | 0/0 = NaN | x/0 = +Inf | **NaN**（NaN 参与任何运算仍为 NaN） |
-| 所有帖评论=0，某帖评论>0，其余=0 | x/0 = **+Inf** | 0/0 = NaN | **NaN** |
-| 平均评论=0，所有帖分数>0（平均分数>0） | 0/0 = NaN | 正常值 | **NaN** |
-| 平均分数=0，所有帖评论>0（平均评论>0） | 正常值 | 0/0 = NaN | **NaN** |
-| 平均评论=0，仅 1 条帖有评论（其余=0），分数都正常 | x/0 = **+Inf** | 正常值 | **+Inf** |
+同理 `averageScore == 0` 意味着所有帖子的 Score 都为 0。
 
-后两种场景中只要有一个维度的平均值为 0，就会出现 `0/0 = NaN`，从而整体 Engagement 变成 NaN。`sort.Slice` 中 `NaN > x` 对任何 x 都返回 `false`，`NaN > NaN` 也返回 `false`，导致排序结果**不可预测**（NaN 帖子可能出现在列表任意位置）。
+因此**每条帖子在平均值为 0 的那个维度上，必然是 `0.0 / 0.0 = NaN`，绝不可能出现 `正数 / 0 = +Inf`**——因为如果存在任何一条帖子 CommentCount > 0，totalComments > 0，averageComments 就不会等于 0。
 
-现实中出现的典型场景：
+Go 语言规则：`NaN` 参与任何算术运算结果仍为 `NaN`。所以最终 Engagement 的所有可能性：
+
+| 场景 | 评论维度 | 分数维度 | Engagement 结果 |
+|------|---------|---------|----------------|
+| averageComments = 0，averageScore = 0 | NaN | NaN | **NaN** |
+| averageComments = 0，averageScore > 0 | NaN | 有限值 | **NaN** |
+| averageComments > 0，averageScore = 0 | 有限值 | NaN | **NaN** |
+| averageComments > 0，averageScore > 0 | 有限值 | 有限值 | 有限值（正常） |
+
+结论：**只要任一维度的平均值为 0，所有帖子的 Engagement 都会变成 NaN，不存在产生 +Inf / -Inf 的可达路径。**
+
+`sort.Slice` 中 `NaN > x` 对任何 x 都返回 `false`，`NaN > NaN` 也返回 `false`，导致排序结果**不可预测**（NaN 帖子可能出现在列表任意位置）。
+
+现实中触发的典型场景：
 - 新建 subreddit 或 HN 分类下全是新帖，所有帖都是 0 评论 0 分
-- Reddit 的 `show-flairs: false` 或过滤后只剩无人互动的帖子
+- Reddit 过滤置顶帖后剩余帖子恰好全是 0 互动
 - 数据拉取出现 `errPartialContent`，成功拿到的几条恰好全是 0 互动
 
 ### 7.2 时间折旧（代码真实行为）
