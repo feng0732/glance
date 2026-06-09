@@ -166,7 +166,17 @@ func (a *application) handleUnauthorizedResponse(w http.ResponseWriter, r *http.
 }
 ```
 
-**前端现状**：[page.js L6-L13](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/js/page.js#L6-L13) 中 `fetchPageContent` 有明确 TODO 注释说明未处理非 200 状态码，所以未登录时内容请求会走到请求失败分支（加载态永远停留）。
+**前端实际现象（经代码验证）**：
+
+fetch API 对 HTTP 4xx/5xx 状态码**不会 reject Promise**，只有网络层错误（DNS 解析失败、连接被拒绝、CORS 阻止等）才会触发 reject。因此：
+
+1. `fetch()` 返回 `response`，`response.status = 401`，`response.ok = false`
+2. `response.text()` 正常返回 `{"error": "Unauthorized"}` 这个 JSON 字符串
+3. `pageContentElement.innerHTML = '{"error": "Unauthorized"}'` → 页面显示 JSON 纯文本
+4. `try/finally` 正常进入 finally → 执行 `content-ready` 类添加到 `#page`
+5. `aria-busy` 设置为 `"false"`，loading 容器隐藏
+
+**最终结果**：页面渲染 JSON 纯文本错误消息代替正常内容，loading 正常消失，不会永远停留。加载态永远停留只发生在真正的网络错误（fetch reject）时。
 
 **关键差异代码**：
 
@@ -175,26 +185,50 @@ func (a *application) handleUnauthorizedResponse(w http.ResponseWriter, r *http.
 func (a *application) handlePageRequest(w http.ResponseWriter, r *http.Request) {
     data := templateData{Page: page, App: a}
     a.populateTemplateRequestData(&data.Request, r)
-    pageTemplate.Execute(&responseBytes, data)  // pageTemplate = page.html + document.html + footer.html
+    pageTemplate.Execute(&responseBytes, data)
     w.Write(responseBytes.Bytes())
 }
 
-// glance.go L334-L367 — 增量片段
+// glance.go L334-L367 — 增量片段（经代码验证的精确执行顺序）
 func (a *application) handlePageContentRequest(w http.ResponseWriter, r *http.Request) {
+    // 1. 解析路由参数，404 检查（无锁）
+    // 2. 鉴权检查，401 返回（无锁）
     pageData := templateData{Page: page}
-    page.mu.Lock()
-    defer page.mu.Unlock()
-    page.updateOutdatedWidgets()  // ★ 路由边界前：先刷新过期 widget 数据
-    pageContentTemplate.Execute(&responseBytes, pageData)  // pageContentTemplate = page-content.html
+    var err error
+    var responseBytes bytes.Buffer
+
+    // 3. 通过 IIFE 精准控制锁范围
+    func() {
+        page.mu.Lock()          // ★ 加 page 级互斥锁（定义见 config.go L91）
+        defer page.mu.Unlock()  // ★ IIFE 返回时自动解锁
+
+        page.updateOutdatedWidgets()                    // 3a. 并发更新所有过期 widget
+        err = pageContentTemplate.Execute(&responseBytes, pageData)  // 3b. 渲染模板到内存缓冲区
+    }()
+    // 4. 锁已释放，检查模板错误（无锁）
+    // 5. 写入 HTTP 响应（无锁，减少锁持有时间）
     w.Write(responseBytes.Bytes())
 }
 ```
 
+**服务端锁与并发的精确细节（经代码验证）**：
+
+- `page.mu` 是 `sync.Mutex`（不是 RWMutex），定义在 [config.go L91](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/config.go#L91)，每个 `page` 实例独立持有，不同 page 之间互不阻塞
+- 锁保护范围：`updateOutdatedWidgets()` + `pageContentTemplate.Execute()`，即"数据刷新 + 模板渲染"整个读-改-写过程
+- `updateOutdatedWidgets()` 内部使用 `sync.WaitGroup` + goroutine 并发更新所有过期 widget（见 [glance.go L233-L270](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/glance.go#L233-L270)），但整个并发过程都在 page 锁保护之内
+- `wg.Wait()` 阻塞直到所有并发 widget 更新完成，才继续渲染模板
+- `w.Write()` 在锁外执行，最小化临界区，避免慢客户端拉长锁持有时间
+- 多个并发请求同一 page 时：第一个请求持锁执行"更新+渲染"，后续请求排队等待锁，拿到锁后再判断是否需要更新
+
 ### 2.3 片段模板的结构
 
-[page-content.html](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/templates/page-content.html) 仅包含两部分：
+[page-content.html](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/templates/page-content.html) 共三部分，两部分为条件渲染：
 
 ```html
+{{ if .Page.ShowMobileHeader }}
+<div class="mobile-reachability-header">{{ .Page.Title }}</div>
+{{ end }}
+
 {{ if .Page.HeadWidgets }}
 <div class="head-widgets">
     {{- range .Page.HeadWidgets }}
@@ -213,6 +247,16 @@ func (a *application) handlePageContentRequest(w http.ResponseWriter, r *http.Re
 {{- end }}
 </div>
 ```
+
+**三部分组成说明（经代码验证）**：
+
+| 顺序 | DOM 块 | 渲染条件 | 内容 |
+|------|--------|----------|------|
+| 1 | `.mobile-reachability-header` | `.Page.ShowMobileHeader == true` | 页面标题文字（仅窄屏生效） |
+| 2 | `.head-widgets` | `len(.Page.HeadWidgets) > 0` | 顶部独立 widget 组 |
+| 3 | `.page-columns` | 始终渲染（无外层条件） | 按列布局的主 widget 区，可能为空 |
+
+第 1 部分和第 2 部分内部各自嵌套循环调用 `.Render()`，第 3 部分是列 → widget 的双层循环。
 
 ### 2.4 移动端页头返回边界处理
 
@@ -300,11 +344,11 @@ pageContentElement.innerHTML = pageContent;
 - 替换后：执行 `contentReadyCallbacks` 队列，重新绑定所有 widget 的 JS 交互
 - 副作用：所有 DOM 节点被销毁重建，需要 `setupPopovers/setupClocks/setupTodos` 等重新初始化
 
-#### 请求失败时加载态永远停留的边界
+#### 请求失败时加载态停留的边界（经代码验证的两类失败区分）
 
-**触发失败的场景**：
+**触发失败的场景及实际表现**：
 
-1. `fetchPageContent` 有明确 TODO 注释说明未处理异常情况 [page.js L6-L13](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/js/page.js#L6-L13)：
+`fetchPageContent` 有明确 TODO 注释说明未处理非 200 状态码 [page.js L6-L13](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/js/page.js#L6-L13)，但需要区分**HTTP 层错误**和**网络层错误**两类完全不同的行为：
 
 ```javascript
 async function fetchPageContent(pageData) {
@@ -316,17 +360,22 @@ async function fetchPageContent(pageData) {
 }
 ```
 
-2. `setupPage` 中 `try/finally` 的位置关键：`fetchPageContent` 和 `innerHTML` **在 try 块之外**，只有 widget 初始化在 try 内 [page.js L746-L784](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/js/page.js#L746-L784)：
+| 失败类型 | 触发条件 | `fetch()` Promise 状态 | `response.text()` | finally 是否执行 | 最终页面表现 |
+|----------|----------|------------------------|-------------------|------------------|--------------|
+| **HTTP 错误**（401/404/500 等） | 服务端返回非 2xx 状态码 | ✅ resolve，`response.ok = false` | ✅ 正常返回响应体文本 | ✅ 执行 | 响应体被当作 HTML 渲染（如 401 时显示 JSON 纯文本），loading 正常消失 |
+| **网络错误**（DNS/连接/CORS/超时） | 无法建立连接或被浏览器拦截 | ❌ reject，抛出异常 | ❌ 不执行 | ❌ **不执行** | `#page-content` 保持空，loading **永远停留** |
+
+**`setupPage` 中 `try/finally` 的精确位置** [page.js L746-L784](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/js/page.js#L746-L784)：
 
 ```javascript
 async function setupPage() {
-    const pageContent = await fetchPageContent(pageData);  // ← try 外，失败则崩溃
-    pageContentElement.innerHTML = pageContent;            // ← try 外，失败则崩溃
+    const pageContent = await fetchPageContent(pageData);  // 网络错误时在此抛出，后续代码全部跳过
+    pageContentElement.innerHTML = pageContent;            // HTTP 错误时正常执行，写入错误文本
     try {
-        setupPopovers();  // ← try 内，单个 widget 初始化失败不影响 finally
+        setupPopovers();  // try 内，单个 widget 初始化失败不影响 finally
         // ...
     } finally {
-        pageElement.classList.add("content-ready");   // ← 只有成功到达这里才隐藏 loading
+        pageElement.classList.add("content-ready");   // HTTP 错误：正常执行；网络错误：永不执行
         pageElement.setAttribute("aria-busy", "false");
     }
 }
@@ -346,13 +395,14 @@ async function setupPage() {
 }
 ```
 
-逻辑真值表：
+**经代码验证的真值表**：
 
 | 状态 | `.content-ready` | `#page-content` 显示 | `.page-loading-container` 显示 |
 |------|------------------|----------------------|--------------------------------|
 | 初始加载 | ❌ | ❌ | ✅（loading 转圈） |
-| 请求成功 | ✅ | ✅ | ❌ |
-| **请求失败/未登录** | **❌** | **❌** | **✅（永远转圈）** |
+| 请求成功（200） | ✅ | ✅（渲染正常 HTML） | ❌ |
+| HTTP 错误（401/404/500） | ✅ | ✅（渲染错误响应体文本） | ❌ |
+| **网络错误（DNS/连接失败）** | **❌** | **❌（保持空）** | **✅（永远转圈）** |
 
 **加载动画的精确位置**：
 
@@ -582,21 +632,36 @@ document.documentElement.setAttribute("data-scheme", response.headers.get("X-Sch
   │   ├─ .page-loading-container 显示│
   │   └─ GET /api/pages/home/content/│
   │─────────────────────────────────▶│ handlePageContentRequest
-  │  ┌─ 未登录分支 ─┐                │   → isAuthorized() = false
-  │  │ 401 Unauthorized  │           │   → handleUnauthorizedResponse(showUnauthorizedJSON)
-  │  │ {"error":"Unauthorized"}│     │
-  │  │ ↓                          │  │
-  │  │ fetchPageContent() 抛异常   │  │
-  │  │ finally 永不执行           │  │
-  │  │ loading 永远停留           │  │
+  │  ┌─ 未登录分支（HTTP 401）─┐     │   → isAuthorized() = false
+  │  │ 401 Unauthorized          │    │   → handleUnauthorizedResponse(showUnauthorizedJSON)
+  │  │ {"error":"Unauthorized"}  │    │   → 直接返回，不加锁，不更新 widget
+  │  │ ↓                         │    │
+  │  │ fetch resolve（非 reject）│    │
+  │  │ innerHTML = JSON 纯文本   │    │
+  │  │ finally 正常执行           │    │
+  │  │ loading 消失，显示 JSON   │    │
   │  └────────────────────────────┘  │
-  │                                  │   ├─ page.mu.Lock()
-  │                                  │   ├─ page.updateOutdatedWidgets()
-  │                                  │   │   └─ 并发更新所有过期 widget
-  │                                  │   ├─ 渲染 page-content.html
-  │                                  │   │   ├─ {{if ShowMobileHeader}} 移动端页头
-  │                                  │   │   └─ 每个 widget.Render()
-  │                                  │   └─ page.mu.Unlock()
+  │                                  │
+  │  ┌─ 网络错误分支 ────────────┐   │
+  │  │ fetch reject              │   │
+  │  │ 后续代码全部跳过           │   │
+  │  │ finally 永不执行           │   │
+  │  │ loading 永远停留           │   │
+  │  └────────────────────────────┘  │
+  │                                  │
+  │  ┌─ 正常分支（200 OK）───────┐   │   func() {
+  │  │                           │    │     page.mu.Lock() ← page 级互斥锁
+  │  │                           │    │     page.updateOutdatedWidgets()
+  │  │                           │    │       └─ WaitGroup + goroutine 并发更新
+  │  │                           │    │          所有过期 widget
+  │  │                           │    │     渲染 page-content.html:
+  │  │                           │    │       1. {{if ShowMobileHeader}} 移动端页头
+  │  │                           │    │       2. {{if HeadWidgets}} head-widgets
+  │  │                           │    │       3. page-columns (列+widgets)
+  │  │                           │    │     page.mu.Unlock() ← IIFE 返回即解锁
+  │  │                           │    │   }
+  │  │                           │    │   w.Write() ← 锁外写入响应
+  │  └────────────────────────────┘  │
   │ 200 OK (HTML 片段，无任何缓存头) │
   │◀─────────────────────────────────│
   │                                  │
@@ -637,13 +702,14 @@ document.documentElement.setAttribute("data-scheme", response.headers.get("X-Sch
 |--------|------|------|
 | **触发入口** | [page.js:setupPage()](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/js/page.js#L746-L784) | 页面加载后自动触发 fetch 增量请求 |
 | **整页 vs 片段路由分界** | [glance.go:server()](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/glance.go#L436-L516) | `GET /{page}` 返回完整文档，`GET /api/pages/*/content/` 返回片段 |
-| **未登录分支差异** | [auth.go:handleUnauthorizedResponse()](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/auth.go#L289-L303) | 整页请求 → 303 重定向登录页；内容请求 → 401 JSON（前端未处理） |
-| **数据刷新边界** | [glance.go:handlePageContentRequest()](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/glance.go#L334-L367) | 请求到达后先 `updateOutdatedWidgets()` 再渲染模板 |
-| **移动端页头三重边界** | 配置 `ShowMobileHeader` + [mobile.css @media ≤550px](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/mobile.css#L218-L225) + `.content-ready` 类 | 配置开启 + 窄视口 + 请求成功 三者同时满足才显示 |
+| **未登录分支差异** | [auth.go:handleUnauthorizedResponse()](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/auth.go#L289-L303) | 整页请求 → 303 重定向登录页；内容请求 → 401 JSON（前端将 JSON 渲染为纯文本，loading 正常消失） |
+| **数据刷新与锁边界** | [glance.go:handlePageContentRequest()](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/glance.go#L334-L367) IIFE | page 级 `sync.Mutex` 保护 `updateOutdatedWidgets` + 模板执行；`w.Write()` 在锁外；401/404 分支不加锁直接返回 |
+| **内容片段三部分组成** | [page-content.html](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/templates/page-content.html) | ①移动端页头（条件）②head-widgets（条件）③page-columns（始终渲染） |
+| **移动端页头三重边界** | 配置 `ShowMobileHeader` + [mobile.css @media ≤550px](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/mobile.css#L218-L225) + `.content-ready` 类 | 配置开启 + 窄视口 + finally 执行（HTTP 成功/错误都会执行） 三者同时满足才显示 |
 | **DOM 替换边界** | [page.js L753](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/js/page.js#L753) | `innerHTML` 是 L1 替换，之后必须重新绑定所有交互 |
-| **请求失败-loading 停留边界** | [page.js L746-L784](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/js/page.js#L746-L784) try/finally 位置 | fetch/innerHTML 在 try 外，失败则 finally 永不执行，loading 永远转圈 |
-| **loading 精确位置** | [site.css L157-L169](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/site.css#L157-L169) | flex 居中基础上再 `translateY(-250%)`，视觉上偏上 |
+| **HTTP 错误 vs 网络错误分界** | fetch API 规范 + [page.js L6-L13](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/js/page.js#L6-L13) | HTTP 4xx/5xx → fetch resolve，finally 执行，loading 消失；网络错误 → fetch reject，finally 不执行，loading 永远停留 |
+| **loading 精确位置** | [site.css L157-L169](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/site.css#L157-L169) | flex 居中基础上再 `translateY(-250%)`，视觉上偏上 2.5 倍自身高度 |
 | **Widget 激活边界** | [calendar.js L32](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/js/calendar.js#L32) / [todo.js L9](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/js/todo.js#L9) | `swapWith` 将服务端骨架替换为客户端完整组件 |
-| **动态请求必达服务端依据** | Go `http.ResponseWriter` 默认行为 + fetch 默认 cache:'default' | 无 Cache-Control/ETag/Last-Modified 任何缓存头，每次穿透 |
+| **动态请求必达服务端依据** | Go `http.ResponseWriter` 默认行为 + fetch 默认 `cache:'default'` | 无 Cache-Control/ETag/Expires/Last-Modified/Pragma 任何缓存头，每次穿透 |
 | **HTTP 缓存边界** | 静态资源 vs 动态 API | 静态 24h + 内容哈希爆破；动态 API 无任何缓存头 |
 | **服务端缓存边界** | [widget.go:requiresUpdate()](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/widget.go#L173-L183) | Widget 粒度内存缓存，按 cacheType 判定是否需要拉取新数据 |
