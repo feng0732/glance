@@ -344,7 +344,7 @@ func fetchSiteStatusTask(statusRequest *SiteStatusRequest) (siteStatus, error) {
 
 ## 四、超时控制机制
 
-Monitor Widget 实现了**三层超时控制**：
+Monitor Widget 实现了**两层请求级超时**，此外 `widgetBase` 基类还提供了通用的指数退避调度能力（但在 Monitor 中实际不会触发，详见 4.3 节）。
 
 ### 4.1 第一层：请求级超时（单站点）
 
@@ -379,11 +379,33 @@ var defaultHTTPClient = &http.Client{
 - Client 级超时为 **5 秒**，覆盖连接、重定向、读取响应体的全过程
 - 与请求级超时形成**双重保险**，取先触发者
 
-### 4.3 第三层：缓存更新重试退避
+### 4.3 基类退避调度与 Monitor 的实际行为
 
-位置：[widget.go#L350-L367](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget.go#L350-L367)
+`widgetBase` 基类提供了通用的指数退避能力，位置：[widget.go#L350-L367](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget.go#L350-L367)，算法为：重试次数 n，间隔为 n² 分钟，计数器上限 5。
 
-当更新失败时，采用指数退避：重试次数 n，间隔为 n² 分钟，最多 5 次。
+**但对 Monitor Widget 而言，该退避机制永远不会被触发**。原因在于错误传递路径的设计：
+
+1. 单站失败（超时、DNS 错误等）→ 错误存储在 `siteStatus.Error` 中，属于**站点级数据**
+2. `fetchStatusForSites()` 只检查 `workerPoolDo()` 返回的第三个值（Worker Pool 级错误），忽略单站错误
+3. `workerPoolDo()` 的第三个返回值仅在 `job.ctx.Done()` 触发时非 nil，而 Monitor 使用 `context.Background()`，永不取消
+4. 因此传给 `canContinueUpdateAfterHandlingErr()` 的 err **永远为 nil** → 始终走 `scheduleNextUpdate()` → 固定 5 分钟周期
+
+完整的错误传递分析见第十章 10.3 节，以下是所有失败场景与下一次刷新时间的因果关系矩阵：
+
+### 4.4 失败场景与刷新时间因果关系矩阵
+
+| 失败场景 | siteStatus.Error | siteStatus.TimedOut | fetchStatusForSites 返回 err | 调度函数 | 下一次刷新时间 |
+|---------|------------------|---------------------|------------------------------|---------|--------------|
+| **正常 200** | nil | false | nil | scheduleNextUpdate | T + 5min |
+| **HTTP 404/500** | nil | false | nil | scheduleNextUpdate | T + 5min |
+| **单站请求超时** | context.DeadlineExceeded | true | nil | scheduleNextUpdate | T + 5min |
+| **单站 DNS 解析失败** | DNSError | false | nil | scheduleNextUpdate | T + 5min |
+| **单站 TLS 握手失败** | TLSError | false | nil | scheduleNextUpdate | T + 5min |
+| **所有站点全部超时** | 多站均为 DeadlineExceeded | 多站 true | nil | scheduleNextUpdate | T + 5min |
+| **所有站点全部挂掉** | 多站均为非 nil | 多站 false | nil | scheduleNextUpdate | T + 5min |
+| **Worker Pool context 被取消（需改源码）** | 未执行的站点为零值 | false | context.Canceled 或 DeadlineExceeded | scheduleEarlyUpdate | 1min → 4min → 5min（被正常周期截断） |
+
+**结论**：Monitor Widget 在所有正常使用场景下，下一次刷新时间恒为「当前时间 + 缓存周期（默认 5 分钟）」，与被监控站点的健康状态无关。指数退避机制仅存在于基类的理论路径中，对 Monitor 是不可达的死代码。
 
 ---
 
@@ -618,7 +640,7 @@ scheduleNextUpdate() 或 scheduleEarlyUpdate()
 | 设计点 | 方案 | 权衡 |
 |--------|------|------|
 | 并发模型 | 固定 Worker Pool (20) | 避免大量站点时 goroutine 爆炸 |
-| 超时控制 | 三层（请求级3s + Client级5s + 退避重试） | 兼顾灵敏度与稳定性 |
+| 超时控制 | 两层请求级（请求级3s + Client级5s），基类退避机制对 Monitor 为死代码 | 请求级与 Client 级双重保险；退避机制因错误传递路径设计不可达 |
 | TLS 处理 | 双 Client 全局复用 | 避免每个请求创建 Transport，同时隔离安全/非安全请求 |
 | 状态判定 | AltStatusCodes 白名单 + Code>=400/Error | 灵活适配非标准部署（如 401 表示需要登录但服务正常） |
 | URL 分离 | CheckURL vs DefaultURL vs ErrorURL | 探测地址、展示链接、失败跳转三者解耦 |
