@@ -403,6 +403,137 @@ func (w *widgetBase) scheduleEarlyUpdate() *widgetBase {
 - 只有重启进程（内存丢失）或调用方手动置空才会清除
 - 这属于"宁可显示旧数据也不显示空白"的设计哲学
 
+### 5.8 错误提示展示边界：HideHeader、容器与静默失败
+
+前面讨论的是**调度层**（何时重试）和**数据层**（是否保留旧数据），但**展示层**（用户能否看到错误提示图标）还受 `HideHeader` 和容器类型的制约，三者互相独立。
+
+#### 5.8.1 图标的 DOM 归属：notice-icon 位于 header 内部
+
+回顾 [widget-base.html#L2-L27](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/templates/widget-base.html#L2-L27)：
+
+```html
+{{- if not .HideHeader }}
+<div class="widget-header">
+    <h2>...</h2>
+    {{- if and .Error .ContentAvailable }}
+    <div class="notice-icon notice-icon-major" title="{{ .Error }}"></div>
+    {{- else if .Notice }}
+    <div class="notice-icon notice-icon-minor" title="{{ .Notice }}"></div>
+    {{- end }}
+</div>
+{{- end }}
+```
+
+**关键结论**：`.notice-icon`（红/黄圆点）是 `<div class="widget-header">` 的子元素，整个 header 被 `{{- if not .HideHeader }}` 整块包裹。一旦 `HideHeader=true`，标题栏、错误图标、提示图标**一起整体消失**。
+
+但大 ERROR 面板（`ContentAvailable=false` 时渲染）不在 header 内，它在 [widget-base.html#L28-L40](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/templates/widget-base.html#L28-L40) 的 `widget-content` 分支里，**不受 HideHeader 影响**。
+
+#### 5.8.2 普通 Widget（非容器）在 HideHeader 下的表现
+
+| 场景 | HideHeader | ContentAvailable | Error/Notice 状态 | 用户看到什么 |
+|------|-----------|-----------------|-------------------|------------|
+| A | false | true | Error=有 | 标题 + 内容 + **红色小圆点**（tooltip 看详情） |
+| B | false | true | Notice=有 | 标题 + 内容 + **黄色小圆点** |
+| C | false | true | 都无 | 标题 + 内容（正常） |
+| D | false | false | Error=有 | 标题 + **大 ERROR 面板**（含完整错误信息） |
+| E | **true** | true | Error=有 | **只显示内容（静默失败）**，无任何图标 |
+| F | **true** | true | Notice=有 | **只显示内容（静默提示）**，无任何图标 |
+| G | **true** | false | Error=有 | **大 ERROR 面板**（不受 HideHeader 影响） |
+
+**场景 E/F 是"隐形失败"**：调度层在按指数退避默默重试、数据层保留了旧内容，但用户界面上**没有任何视觉线索**表明内容可能已过期。
+
+#### 5.8.3 Group 容器：双层 HideHeader 导致图标彻底消失
+
+Group 的初始化逻辑在 [widget-group.go#L17-L36](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-group.go#L17-L36)：
+
+```go
+func (widget *groupWidget) initialize() error {
+    widget.withError(nil)
+    widget.HideHeader = true                              // ① 容器自身隐藏 header
+
+    for i := range widget.Widgets {
+        widget.Widgets[i].setHideHeader(true)              // ② 强制所有子 widget 也隐藏 header
+        ...
+    }
+    ...
+}
+```
+
+Group 模板 [group.html](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/templates/group.html) 用自定义的 tab 栏替代了普通 header：
+
+```html
+<div class="widget-group-header">
+    <div class="widget-header gap-20" role="tablist">
+        {{- range $i, $widget := .Widgets }}
+        <button class="widget-group-title...">{{ $widget.Title }}</button>
+        {{- end }}
+    </div>
+</div>
+```
+
+这个自定义 tab header 中**完全没有 notice-icon 的渲染逻辑**。再加上子 widget 的 header 被集体隐藏，导致：
+
+| 子 Widget 状态 | 用户看到什么 |
+|--------------|------------|
+| ContentAvailable=true + Error | tab 标题正常 + 旧内容正常渲染，**无任何图标**（静默失败） |
+| ContentAvailable=true + Notice | 同上，无任何图标 |
+| ContentAvailable=false + Error | 该 tab 页内显示**大 ERROR 面板**（子 widget 的 widget-content 不受 header 影响） |
+
+**Group 容器下没有"小圆点"这种轻度提示**，要么完全静默（有旧内容时），要么整个 tab 内容区变成大 ERROR 面板（首次失败时）。
+
+另外注意：容器自身的 `Error` / `Notice` 字段永远为 nil——`containerWidgetBase._update()` [widget-container.go#L23-L42](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-container.go#L23-L42) 只是并发调用子 widget 的 `update()`，**没有任何错误聚合逻辑**。容器不会把"第 3 个子 widget 失败了"反映到自己的 Error 字段上。
+
+#### 5.8.4 Split-column 容器：只隐藏自身 header，子 widget 保留图标
+
+Split-column 的初始化在 [widget-split-column.go#L17-L29](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-split-column.go#L17-L29)：
+
+```go
+func (widget *splitColumnWidget) initialize() error {
+    widget.withError(nil).withTitle("Split Column").setHideHeader(true)  // 只隐藏容器自身
+    // 没有对子 widget 调用 setHideHeader(true)！
+    ...
+}
+```
+
+模板 [split-column.html](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/templates/split-column.html) 用 masonry 布局直接渲染每个子 widget：
+
+```html
+<div class="masonry" data-max-columns="{{ .MaxColumns }}">
+{{ range .Widgets }}
+    {{ .Render }}   <!-- 每个子 widget 完整渲染自己的 widget-base.html -->
+{{ end }}
+</div>
+```
+
+因此子 widget 的行为和独立放置时完全一致：如果子 widget 自身没有设置 `hide-header: true`，它的 header 和错误图标都会正常显示。
+
+| 子 Widget 状态 | HideHeader（子 widget 自身） | 用户看到什么 |
+|--------------|---------------------------|------------|
+| ContentAvailable=true + Error | false（默认） | 子 widget 完整 header + **红色小圆点** + 内容 |
+| ContentAvailable=true + Error | true（用户手动配置） | 只显示内容，静默失败 |
+| ContentAvailable=false + Error | 任意 | 该子 widget 区域显示大 ERROR 面板 |
+
+Split-column 容器自身的 header 虽然被隐藏了，但容器自身没有 Error/Notice 状态（无聚合），所以没有影响。
+
+#### 5.8.5 展示层与短缓存调度层的对应关系
+
+将展示层的可见性与前面的调度/数据层机制对照：
+
+| 组合场景 | 调度层（nextUpdate） | 数据层（ContentAvailable） | 展示层（用户可见） | 失败可感知吗？ |
+|---------|-------------------|-------------------------|------------------|--------------|
+| 普通 Widget 刷新失败，有旧内容，HideHeader=false | 1→4→9→16→25 min 退避 | true，保留旧数据 | 内容 + 红色小圆点 | ✅ 轻度感知 |
+| 普通 Widget 刷新失败，有旧内容，HideHeader=true | 1→4→9→16→25 min 退避 | true，保留旧数据 | **只显示旧内容** | ❌ 完全不可感知 |
+| Group 中子 Widget 刷新失败，有旧内容 | 1→4→9→16→25 min 退避 | true，保留旧数据 | **只显示旧内容** | ❌ 完全不可感知 |
+| Split-column 中子 Widget 刷新失败，有旧内容，子 header 未隐藏 | 1→4→9→16→25 min 退避 | true，保留旧数据 | 子 widget header + 红色小圆点 + 内容 | ✅ 轻度感知 |
+| 任何 Widget 首次加载失败 | 1→4→9→16→25 min 退避 | false，无数据 | **大 ERROR 面板** | ✅ 强感知 |
+| 任何 Widget 部分失败（errPartialContent） | 1→4→9→16→25 min 退避 | true，部分数据被覆盖 | 内容 + 黄色小圆点（或静默，取决于 HideHeader） | ⚠️ 条件感知 |
+
+**核心洞察**：
+1. **调度层完全独立于展示层**：无论用户能否看到图标，后台重试节奏都是 1→4→9→16→25 分钟。HideHeader 和容器类型不影响 `scheduleEarlyUpdate()` 的调用。
+2. **"有旧内容 + HideHeader=true" 或 "子 widget 在 Group 内" 是静默失败的两大来源**：用户看着正常内容，不知道 API 可能已经挂了几小时，后台在默默重试。
+3. **大 ERROR 面板是唯一不受 HideHeader 影响的错误提示**——当 `ContentAvailable=false` 时，错误信息直接渲染在内容区，没有任何开关可以隐藏它。这保证了"首次加载就失败"的场景永远不会静默。
+4. **容器没有错误聚合**：Group/Split-column 不会统计有多少个子 widget 失败了并展示汇总提示。每个子 widget 的错误状态只能由自己独立呈现（如果 header 可见）。
+
 ---
 
 ## 六、击穿保护（Cache Stampede Protection）
@@ -531,5 +662,10 @@ widget-base.html 模板渲染
 | [widget-rss.go](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-rss.go) | ETag/Last-Modified 二级缓存示例 |
 | [widget-reddit.go](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-reddit.go) | Singleflight + 本地缓存组合示例 |
 | [widget-weather.go](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-weather.go) | OnTheHour 整点缓存示例 |
-| [widget-base.html](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/templates/widget-base.html) | 模板层错误/Notice 两种呈现逻辑 |
+| [widget-base.html](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/templates/widget-base.html) | 模板层错误/Notice 两种呈现逻辑，notice-icon 归属 header |
 | [widget-videos.go](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-videos.go) | 典型 update() 模式：return false 阻止覆盖旧数据 |
+| [widget-group.go](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-group.go) | Group 容器：双层 HideHeader，强制子 widget 隐藏 header |
+| [group.html](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/templates/group.html) | Group 模板：自定义 tab 栏无 notice-icon 渲染 |
+| [widget-split-column.go](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-split-column.go) | Split-column 容器：仅隐藏自身 header，子 widget 保留图标 |
+| [split-column.html](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/templates/split-column.html) | Split-column 模板：masonry 布局直接渲染子 widget |
+| [site.css](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/static/css/site.css#L195-L207) | notice-icon 样式：major 红色实心 / minor 黄色空心边框 |
