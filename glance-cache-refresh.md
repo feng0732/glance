@@ -536,150 +536,245 @@ Split-column 容器自身的 header 虽然被隐藏了，但容器自身没有 E
 
 ### 5.9 Extension Widget：不遵循通用模式的例外路径
 
-Extension Widget 是整个系统中**唯一刻意偏离**"提前 return 保住旧内容"设计模式的 Widget。它的异常处理路径在 [widget-extension.go#L45-L67](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-extension.go#L45-L67)，与通用模式有四处根本性差异。
+Extension Widget 的异常处理在 [widget-extension.go#L45-L67](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-extension.go#L45-L67)，是全系统中唯一偏离"提前 return 保住旧内容"模式的实现。下面严格区分**代码可直接证实的实现现象**和**无直接证据、仅能谨慎推测的设计解释**。
 
-#### 5.9.1 差异一：canContinueUpdateAfterHandlingErr 的返回值被丢弃
+---
 
-通用模式（以 videos 为例，[widget-videos.go#L66-L78](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-videos.go#L66-L78)）：
+#### 5.9.1 代码可直接证实的实现现象
 
-```go
-func (widget *videosWidget) update(ctx context.Context) {
-    videos, err := fetchYoutubeChannelUploads(...)
-    if !widget.canContinueUpdateAfterHandlingErr(err) {
-        return          // ← 失败时提前 return，后续赋值不执行
-    }
-    widget.Videos = videos  // ← 只有成功/部分成功才走到这里
-}
-```
+以下每一条都有明确代码行作为证据，不含推测。
 
-Extension 模式：
+##### 现象 1：`canContinueUpdateAfterHandlingErr` 返回值被丢弃，后续代码无条件执行
+
+通用模式（videos 为例，[widget-videos.go#L66-L78](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-videos.go#L66-L78)）：
 
 ```go
-func (widget *extensionWidget) update(ctx context.Context) {
-    extension, err := fetchExtension(...)
-    widget.canContinueUpdateAfterHandlingErr(err)   // ← 返回值被丢弃！
-
-    widget.Extension = extension                     // ← 无论成功失败，无条件覆盖
-    widget.cachedHTML = widget.renderTemplate(widget, extensionWidgetTemplate)
+if !widget.canContinueUpdateAfterHandlingErr(err) {
+    return          // 失败时中止，后续赋值不执行
 }
+widget.Videos = videos
 ```
 
-`canContinueUpdateAfterHandlingErr` 的 **side effects 仍然执行**（`scheduleEarlyUpdate()`、`withError(err)` 等），但它的 `return false` 被完全忽略。后续代码不会被中止。
+Extension 模式 [widget-extension.go#L54-L66](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-extension.go#L54-L66)：
 
-#### 5.9.2 差异二：失败时 Extension 字段被零值覆盖而非保留旧值
+```go
+widget.canContinueUpdateAfterHandlingErr(err)   // 返回值未赋值给任何变量，等价于丢弃
 
-当 `fetchExtension` 失败时（如网络错误、body 读取失败），它返回 `(extension{}, error)`，即**空的零值结构体**。零值定义在 [widget-extension.go#L99-L104](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-extension.go#L99-L104)：
+widget.Extension = extension                     // 后续三行无条件执行
+widget.Title = ...
+widget.cachedHTML = ...
+```
+
+`canContinueUpdateAfterHandlingErr` 的 side effects 仍然生效（`scheduleEarlyUpdate()` 设置 nextUpdate、`withError(err)` 设置 Error 字段），但 `return false` 的中止语义被忽略。
+
+##### 现象 2：失败时 4 个字段的保留/覆盖行为各不相同
+
+`update()` 方法中涉及 4 个字段的修改，它们的条件完全不同，下面逐一列出来源代码。
+
+**字段 A：`widget.Extension`（整体）**
+
+代码位置 [widget-extension.go#L56](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-extension.go#L56)：
+
+```go
+widget.Extension = extension
+```
+
+这是无任何条件的直接赋值。失败时 `fetchExtension` 返回的 `extension` 是零值结构体 [widget-extension.go#L99-L104](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-extension.go#L99-L104)：
 
 ```go
 type extension struct {
     Title     string       // 零值 = ""
     TitleURL  string       // 零值 = ""
-    Content   template.HTML // 零值 = template.HTML("") 空 HTML
+    Content   template.HTML // 零值 = template.HTML("")
     Frameless bool         // 零值 = false
 }
 ```
 
-配合差异一的"无条件覆盖"：
+结论：`widget.Extension` **无论成功失败都被覆盖**，失败时被零值覆盖，旧内容永久丢失。
+
+---
+
+**字段 B：`widget.Title`**
+
+代码位置 [widget-extension.go#L58-L60](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-extension.go#L58-L60)：
 
 ```go
-widget.Extension = extension   // extension 是零值 → 旧的 Extension.Content 被空字符串覆盖
-```
-
-这与通用模式"失败时字段原封不动"完全相反。
-
-#### 5.9.3 差异三：cachedHTML 预渲染缓存导致失败时渲染"空内容 + 红图标"
-
-Extension 的 `Render()` [widget-extension.go#L69-L71](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-extension.go#L69-L71) 是全系统中**唯一返回预渲染缓存**的：
-
-```go
-func (widget *extensionWidget) Render() template.HTML {
-    return widget.cachedHTML    // 直接返回 update() 时预先渲染好的 HTML
+if widget.Title == extensionWidgetDefaultTitle && extension.Title != "" {
+    widget.Title = extension.Title
 }
 ```
 
-其他 Widget（如 videos）的 `Render()` [widget-videos.go#L80-L93](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-videos.go#L80-L93) 每次都实时调用 `widget.renderTemplate(widget, template)`。
+`extensionWidgetDefaultTitle = "Extension"`，在初始化时通过 `widget.withTitle(extensionWidgetDefaultTitle)` 设置 [widget-extension.go#L32](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-extension.go#L32)。
 
-Extension 的 `cachedHTML` 在每次 `update()` 的最后一行重新生成，失败时也不例外：
+更新 Title **必须同时满足两个条件**：
+1. `widget.Title == "Extension"`（当前 Title 仍是默认值，从未被远端覆盖过）
+2. `extension.Title != ""`（本次返回的 extension.Title 非空）
+
+失败时 `extension.Title = ""`（零值），条件 2 恒为 false → **Title 保持原值不变**。
+
+成功时 `extension.Title` 的值取决于远端响应头 [widget-extension.go#L145-L149](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-extension.go#L145-L149)：
+- 远端未传 `Widget-Title` header → `extension.Title = "Extension"`（注意：不是空串，是默认值字符串）
+- 远端传了 header → `extension.Title = 远端指定值`
+
+结论：
+- 失败时：**Title 永远保留原值**（不覆盖）
+- 成功且 Title 曾被远端自定义过（`widget.Title != "Extension"`）：**保留原值**
+- 成功且 Title 仍是默认值、远端传了自定义 header：**更新为远端标题**
+- 成功且 Title 仍是默认值、远端未传 header：条件看似满足但赋值为相同字符串，无实际变化
+
+---
+
+**字段 C：`widget.TitleURL`**
+
+代码位置 [widget-extension.go#L62-L64](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-extension.go#L62-L64)：
+
+```go
+if widget.TitleURL == "" && extension.TitleURL != "" {
+    widget.TitleURL = extension.TitleURL
+}
+```
+
+更新 TitleURL **必须同时满足两个条件**：
+1. `widget.TitleURL == ""`（当前 TitleURL 为空，从未被设置过）
+2. `extension.TitleURL != ""`（本次返回的 extension.TitleURL 非空）
+
+失败时 `extension.TitleURL = ""`（零值），条件 2 恒为 false → **TitleURL 保持原值不变**。
+
+成功时 `extension.TitleURL` 只有在远端传了 `Widget-Title-URL` header 时才非空 [widget-extension.go#L151-L153](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-extension.go#L151-L153)。
+
+结论：
+- 失败时：**TitleURL 永远保留原值**（不覆盖）
+- 成功且 TitleURL 曾被设置过（非空）：**保留原值**
+- 成功且 TitleURL 为空、远端传了 header：**更新为远端 URL**
+- 成功且 TitleURL 为空、远端未传 header：**保持为空**
+
+---
+
+**字段 D：`widget.cachedHTML`**
+
+代码位置 [widget-extension.go#L66](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-extension.go#L66)：
 
 ```go
 widget.cachedHTML = widget.renderTemplate(widget, extensionWidgetTemplate)
 ```
 
-此时各状态位为：
-- `Error = err`（被 `canContinueUpdateAfterHandlingErr` 设置）
-- `ContentAvailable`：**保持原值**（`withError(err)` 不修改它）
-- `Extension.Content = ""`（被零值覆盖）
+这是无条件赋值。Extension 的 `Render()` [widget-extension.go#L69-L71](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-extension.go#L69-L71) 是全系统中**唯一返回预渲染缓存**的：
 
-模板 [extension.html](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/templates/extension.html) 的 `widget-content` block 就是 `{{ .Extension.Content }}`——空字符串。
+```go
+func (widget *extensionWidget) Render() template.HTML {
+    return widget.cachedHTML
+}
+```
 
-因此失败时的完整渲染输出取决于 `ContentAvailable` 的历史值：
+其他 Widget（如 videos）的 `Render()` [widget-videos.go#L80-L93](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-videos.go#L80-L93) 每次都实时调用 `widget.renderTemplate()`。
 
-| | ContentAvailable=true（之前成功过） | ContentAvailable=false（首次失败） |
-|---|---|---|
-| widget-base.html 分支 | `{{ block "widget-content" . }}` → 走内容分支 | `{{ else }}` → 走 ERROR 分支 |
-| Extension.Content | 空字符串 | 空字符串（但不走这个分支） |
-| 实际输出 | `<div class="widget-content">` **空内容** `</div>` + Header 上红色小圆点 | `<div class="widget-content">` **大 ERROR 面板** `</div>` |
-| 用户看到 | 一个可能带边框的空白区域 + 红点 | 完整错误页 + 错误详情 |
+失败时调用 `renderTemplate` 的时刻，各状态为：
+- `Error = err`（由 `canContinueUpdateAfterHandlingErr` 设置）
+- `ContentAvailable`：保持原值（`withError(err)` 不修改它）
+- `Extension.Content = ""`（已被零值覆盖）
+- `Extension.Title` / `Extension.TitleURL`：已被零值覆盖为 `""`
 
-#### 5.9.4 差异四：fetchExtension 不检查 HTTP 状态码
+模板 [extension.html](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/templates/extension.html) 的内容块是 `{{ .Extension.Content }}`，即空字符串。
 
-[fetchExtension()](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-extension.go#L119-L172) 只在**网络层失败**（`http.DefaultClient.Do` 返回 error）或 **body 读取失败**时返回错误：
+结论：`widget.cachedHTML` **无论成功失败都被覆盖重渲染**。失败时渲染结果取决于 `ContentAvailable`：
+- `ContentAvailable = true`（之前成功过）：渲染出"空内容区域 + 红圆点图标"的 HTML
+- `ContentAvailable = false`（首次失败）：渲染出大 ERROR 面板的 HTML
+
+---
+
+##### 现象 3：`fetchExtension` 不检查 HTTP 状态码
+
+[fetchExtension()](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget-extension.go#L119-L172) 的两个错误返回点：
 
 ```go
 response, err := http.DefaultClient.Do(request)
 if err != nil {
     return extension{}, fmt.Errorf("%w: request failed: %w", errNoContent, err)
 }
-// 没有检查 response.StatusCode！
+// 代码中不存在 response.StatusCode / response.Status 的检查
 body, err := io.ReadAll(response.Body)
 if err != nil {
     return extension{}, fmt.Errorf("%w: could not read body: %w", errNoContent, err)
 }
-// 即使是 404/500/503，只要 body 能读出来，就当作成功
-extension.Content = convertExtensionContent(options, body, contentType)
-return extension, nil   // err = nil，调度层会当成完全成功
+// 后续直接把 body 当作内容返回，err = nil
+return extension, nil
 ```
 
-这意味着远端返回 HTTP 404、500、503 等状态时，Extension Widget **不会进入错误处理路径**，而是把错误页面的 HTML 当作正常内容展示出来，同时 `scheduleNextUpdate()` 按正常 30 分钟 TTL 调度，退避计数也被清零。
+结论：只有 TCP/TLS 连接失败、DNS 解析失败等**网络层错误**和**body 读取错误**才被视为失败。远端返回 HTTP 404/500/503 等状态时，只要 body 能读出字节，`err` 就为 `nil`，调度层走 `scheduleNextUpdate()` 正常 TTL 分支，退避计数被清零，错误页面的 HTML 被当作正常内容渲染。
 
-#### 5.9.5 两种失败场景的完整状态机
+##### 现象 4：`canContinueUpdateAfterHandlingErr` 自身承认尚未覆盖所有 edge case
 
-**场景 A：之前成功过（ContentAvailable=true），现在网络失败**
+该函数开头有一段 TODO 注释 [widget.go#L294-L305](file:///d:/fz/0601/solo-dogfeeding/code/147-glance/internal/glance/widget.go#L294-L305)：
 
-| 步骤 | Extension.Content | ContentAvailable | Error | cachedHTML | nextUpdate | 用户看到 |
-|------|-------------------|-----------------|-------|-----------|------------|---------|
-| 初始 | `<p>上次成功的内容</p>` | true | nil | 含正常内容的 HTML | now+30min | 正常页面 |
-| fetchExtension 网络错误 | `<p>上次成功的内容</p>` | true | nil | 含正常内容的 HTML | now+30min | 正常页面 |
-| canContinueUpdateAfterHandlingErr(errNoContent) | `<p>上次成功的内容</p>` | **true**（不变） | err | 含正常内容的 HTML | now+1min | 正常页面 |
-| `widget.Extension = extension`（零值覆盖！） | **""（空）** | true | err | 含正常内容的 HTML | now+1min | - |
-| `widget.cachedHTML = renderTemplate(...)` | "" | true | err | **空内容区域 + 红图标的 HTML** | now+1min | - |
-| 最终 Render() | "" | true | err | 空内容 HTML | now+1min | **空白框 + 右上角红点** |
+```go
+// TODO: needs covering more edge cases.
+// if there's partial content and we update early there's a chance
+// the early update returns even less content than the initial update.
+// ... will require reworking a good amount of code ...
+// alternatively have a resource cache and only refetch the failed resources,
+// then rebuild the widget.
+```
 
-**场景 B：首次加载就失败（ContentAvailable=false）**
+结论：错误处理框架本身作者也标注为"未完成、需要重构"。Extension 的特殊模式是否属于有意识的设计决策，代码中没有直接证据。
 
-| 步骤 | Extension.Content | ContentAvailable | Error | cachedHTML | nextUpdate | 用户看到 |
-|------|-------------------|-----------------|-------|-----------|------------|---------|
-| 初始 | "" | false | nil | "" | 零值 | - |
-| fetchExtension 网络错误 | "" | false | nil | "" | 零值 | - |
-| canContinueUpdateAfterHandlingErr(errNoContent) | "" | **false**（不变） | err | "" | now+1min | - |
-| `widget.Extension = extension` | ""（已是零值） | false | err | "" | now+1min | - |
-| `widget.cachedHTML = renderTemplate(...)` | "" | false | err | **大 ERROR 面板 HTML** | now+1min | - |
-| 最终 Render() | "" | false | err | ERROR 面板 HTML | now+1min | **大 ERROR 面板** |
+---
 
-#### 5.9.6 通用模式 vs Extension 模式对照表
+#### 5.9.2 完整状态变化矩阵（所有字段，两种失败场景）
+
+**场景 A：之前成功过（ContentAvailable=true，Title 曾被远端自定义为 "My Dashboard"，TitleURL 曾设为 "https://..."），现在网络失败**
+
+| 步骤 | widget.Extension.Content | widget.Title | widget.TitleURL | widget.cachedHTML | ContentAvailable | Error | nextUpdate |
+|------|--------------------------|-------------|-----------------|-------------------|-----------------|-------|------------|
+| 初始 | `<p>上次成功内容</p>` | "My Dashboard" | "https://..." | 含正常内容的 HTML | true | nil | now+30min |
+| fetchExtension 网络错误，返回 `(extension{}, err)` | `<p>上次成功内容</p>` | "My Dashboard" | "https://..." | 含正常内容的 HTML | true | nil | now+30min |
+| `canContinueUpdateAfterHandlingErr(err)` | `<p>上次成功内容</p>` | "My Dashboard" | "https://..." | 含正常内容的 HTML | **true**（不变） | err | now+1min |
+| `widget.Extension = extension`（无条件覆盖） | **""（空，丢失）** | "My Dashboard" | "https://..." | 含正常内容的 HTML | true | err | now+1min |
+| `widget.Title = ...`（条件不满足：Title≠默认值） | "" | **"My Dashboard"（保留）** | "https://..." | 含正常内容的 HTML | true | err | now+1min |
+| `widget.TitleURL = ...`（条件不满足：TitleURL≠空） | "" | "My Dashboard" | **"https://..."（保留）** | 含正常内容的 HTML | true | err | now+1min |
+| `widget.cachedHTML = renderTemplate(...)`（无条件） | "" | "My Dashboard" | "https://..." | **空内容+红点的 HTML（覆盖）** | true | err | now+1min |
+| 最终用户可见 | — | "My Dashboard" 显示在 header | 标题链接保留 | 空白框+红点 | — | tooltip 可见错误 | 1min 后重试 |
+
+**场景 B：首次加载失败（ContentAvailable=false，Title="Extension" 默认值，TitleURL=""）**
+
+| 步骤 | widget.Extension.Content | widget.Title | widget.TitleURL | widget.cachedHTML | ContentAvailable | Error | nextUpdate |
+|------|--------------------------|-------------|-----------------|-------------------|-----------------|-------|------------|
+| 初始 | "" | "Extension" | "" | "" | false | nil | 零值 |
+| fetchExtension 网络错误 | "" | "Extension" | "" | "" | false | nil | 零值 |
+| `canContinueUpdateAfterHandlingErr(err)` | "" | "Extension" | "" | "" | **false**（不变） | err | now+1min |
+| `widget.Extension = extension` | ""（已是零值） | "Extension" | "" | "" | false | err | now+1min |
+| `widget.Title = ...`（条件不满足：extension.Title=""） | "" | **"Extension"（保留）** | "" | "" | false | err | now+1min |
+| `widget.TitleURL = ...`（条件不满足：extension.TitleURL=""） | "" | "Extension" | **""（保留）** | "" | false | err | now+1min |
+| `widget.cachedHTML = renderTemplate(...)` | "" | "Extension" | "" | **大 ERROR 面板 HTML（覆盖）** | false | err | now+1min |
+| 最终用户可见 | — | "Extension" 显示在 ERROR 面板上方 | 空（无链接） | 完整错误页 | — | 错误详情可见 | 1min 后重试 |
+
+---
+
+#### 5.9.3 仅能谨慎推测的设计解释
+
+以下内容代码中无直接注释或文档佐证，属于基于现象的合理推断：
+
+| 推测 | 支持的现象 | 反证/不确定性 |
+|------|-----------|-------------|
+| **推测 A：Extension 不保留旧内容是出于第三方 HTML 的安全考虑** | Extension.Content 是外部任意 HTML，旧内容可能含过期链接、失效 CSRF token、已移除的脚本。空白比"可能已坏掉的外部 HTML"更安全。 | 代码中没有任何安全相关注释。`withTitle`/`withTitleURL` 的"只写一次"模式暗示了对远端元数据的某种不信任，但这是对所有 Widget 的通用行为，非 Extension 独有。 |
+| **推测 B：丢弃返回值是疏忽，而非刻意设计** | `canContinueUpdateAfterHandlingErr` 开头有 TODO 注释承认"需要覆盖更多 edge case、需要重构大量代码"；全系统 28 个 Widget 中只有 Extension 1 个不检查返回值，模式极不统一。 | 也可能作者在写 Extension 时确实想要"无论如何都重新渲染 cachedHTML"，所以故意绕过了提前 return。没有代码注释能区分这两种可能。 |
+| **推测 C：cachedHTML 预渲染是性能优化** | Extension 内容是完整 HTML 片段（可能较大），每次页面请求都执行模板引擎有成本，update 时预渲染一次可节省后续渲染开销。 | 其他 Widget（如 RSS、Reddit）也渲染大量 HTML，但都采用实时渲染模式，没有类似优化。没有性能测试或注释支持此推测。 |
+| **推测 D：不检查 HTTP 状态码是为了灵活性** | Extension 的设计目标是对接任意第三方服务，有些服务可能用非 2xx 状态码返回合法业务内容（如 207 Multi-Status、自定义业务码），不检查状态码留给远端自行决定内容语义。 | 大多数 HTTP 生态中 4xx/5xx 表示错误；RSS Widget 等有明确检查状态码的代码（需要验证），唯独 Extension 没有，也可能是遗漏。 |
+
+---
+
+#### 5.9.4 通用模式 vs Extension 模式对照表（仅含可证实部分）
 
 | 维度 | 通用模式（videos、rss、weather 等） | Extension 模式 |
 |------|-----------------------------------|---------------|
-| `canContinueUpdateAfterHandlingErr` 返回值 | `if !xxx { return }` 严格检查 | 完全丢弃 |
-| 失败时业务字段 | **原封不动保留旧值** | **被零值无条件覆盖** |
-| 失败时 ContentAvailable | `withError(err)` 不修改，保持原值 | 同左（保持原值） |
-| 失败时有旧内容用户看到什么 | 旧内容原样显示 + 红/黄圆点 | **空白内容区域** + 红圆点 |
-| 失败时首次加载用户看到什么 | 大 ERROR 面板 | 大 ERROR 面板（相同） |
-| Render() 时机 | 每次页面请求实时 `renderTemplate` | 返回 `update()` 时预渲染的 `cachedHTML` |
-| HTTP 非 2xx 处理 | 各 Widget 自行检查并判为失败 | **不检查**，错误页面 HTML 被当作正常内容，调度视为成功 |
-| 设计哲学 | "宁可显示旧数据也不显示空白" | Extension 内容不可信任，失败时宁愿空白也不展示可能过时的外部 HTML |
-
-Extension 的设计偏离是刻意为之：它展示的是**外部第三方提供的任意 HTML**，出于安全和时效性考虑，失败时不保留旧渲染结果——旧的外部 HTML 可能包含过期链接、过时安全令牌或已失效的交互逻辑，空白比"内容可能已坏掉"更安全。
+| `canContinueUpdateAfterHandlingErr` 返回值 | `if !xxx { return }` 严格检查 | 丢弃，不影响后续执行 |
+| 失败时主数据字段（Videos/Posts/Extension 等） | 原封不动保留旧值 | 被零值无条件覆盖 |
+| 失败时 `widget.Title` | —（通用 Widget 不在 update 中改 Title） | 保留原值（条件不满足） |
+| 失败时 `widget.TitleURL` | —（通用 Widget 不在 update 中改 TitleURL） | 保留原值（条件不满足） |
+| 失败时 `ContentAvailable` | `withError(err)` 不修改，保持原值 | 同左（保持原值） |
+| 失败时有旧内容用户看到什么 | 旧内容原样显示 + 红/黄圆点 | 空白内容区域 + 红圆点 |
+| 失败时首次加载用户看到什么 | 大 ERROR 面板 | 大 ERROR 面板 |
+| `Render()` 实现 | 每次页面请求实时 `renderTemplate` | 返回 `update()` 时预渲染的 `cachedHTML` |
+| HTTP 非 2xx 处理 | 各 Widget 通常自行检查并判为失败 | 不检查，错误响应 body 被当作正常内容，`err=nil` 走成功调度路径 |
 
 ---
 
