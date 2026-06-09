@@ -134,6 +134,20 @@ Reddit 的 `.json` 端点需要 `loid` cookie，流程：
 - `RequestURLTemplate`：将最终请求 URL 通过 `{REQUEST-URL}` 占位符包裹，走用户自定义代理
 - `Proxy` 字段：配置独立 HTTP Proxy Client（[proxyOptionsField](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/config-fields.go#L190-L235)）
 
+**⚠️ Proxy 覆盖边界 — loid challenge 不走代理**
+
+Reddit 相关的 4 种 HTTP 请求对 `proxy` / `RequestURLTemplate` 的遵循情况不一致：
+
+| 请求类型 | 所在函数 | 使用的 HTTP Client | 是否遵循 Proxy |
+|---------|---------|-------------------|---------------|
+| loid JS 挑战页 & 解答提交 | [fetchRedditLoidCookie](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-reddit.go#L389-L456) | **硬编码** `redditHTTPClient`（L397、L439） | ❌ **完全不走** |
+| OAuth Token 获取 | [fetchNewAppAccessToken](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-reddit.go#L297-L324) | `widget.Proxy.client \|\| defaultHTTPClient`（L314） | ✅ 走 Proxy |
+| 帖子列表 JSON | [fetchSubredditPosts](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-reddit.go#L167-L295) | 优先 `RequestURLTemplate`，否则 `widget.Proxy.client`，最后 `redditHTTPClient`（L210-L213） | ✅ 走 Proxy / URL 模板 |
+
+`loid` challenge 不走代理的根本原因：`fetchRedditLoidCookie` 是**包级函数**而非 widget 方法，不持有 `*redditWidget` 指针，因此无法访问 per-widget 的 `Proxy.client` 字段。同时它被全局闭包 `getRedditLoidCookie` 缓存，所有 widget 实例共享同一个 loid 获取流程，设计上就是全局单例资源，与 per-widget proxy 配置不兼容。
+
+如果用户所在环境必须通过代理才能访问 Reddit，会出现"能拿到 OAuth Token、但 loid challenge 超时/失败"的现象。
+
 ## 三、字段映射
 
 统一目标结构 [forumPost](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-shared.go#L14-L26)：
@@ -367,7 +381,19 @@ Engagement *= 1.0 - (math.Max(elapsed.Hours() - 7, 24) / 24) * 0.9
 | 31h | `math.Max(24, 24) = 24` | 0.9 | 10% |
 | 55h | `math.Max(48, 24) = 48` | `(48/24)*0.9 = 1.8` | **-80%（负数！）** |
 
-即：**一旦超过 7 小时阈值，帖子立即被折旧 90%（Engagement × 0.1）；超过 31 小时后 Engagement 变为负数，排序会被推到最底部。** 代码中并无将 Engagement clamp 到 ≥ 0 的保护。
+即：**一旦超过 7 小时阈值，帖子立即被折旧 90%（Engagement × 0.1）。** 代码中并无将 Engagement clamp 到 ≥ 0 的保护。
+
+**Engagement 变负的精确时间阈值：**
+
+当 `elapsed.Hours() - 7 ≥ 24`（即 `elapsed ≥ 31h`）时，`math.Max` 返回 `elapsed - 7`，此时折旧系数随时间线性下滑：
+
+```
+乘数 = 1.0 - ((E - 7) / 24) × 0.9
+令乘数 = 0  →  E - 7 = 24 / 0.9 = 26.666...
+              E = 7 + 26.666... = 33.666... 小时
+```
+
+即发布 **33 小时 40 分钟（约 33.67h）** 后，Engagement 乘数穿越 0 轴变为负数，帖子在排序中会被压到列表最底部。31h ~ 33h40m 之间乘数仍为正（0.1 ~ 0 之间），但已经低于"刚过 7 小时阈值"时的 0.1。
 
 ### 7.3 设计意图（推测）
 
@@ -386,6 +412,59 @@ Engagement *= 1.0 - (math.Min(elapsed.Hours() - 7, 24) / 24) * 0.9
 | 31h+ | 0.9 | 10% |
 
 但由于 `math.Max` vs `math.Min` 的笔误，实际行为与设计意图完全相反。
+
+### 7.4 Reddit vs HackerNews：截断与排序的先后顺序差异
+
+两个 widget 在 `update(ctx)` 中对帖子执行 engagement 排序时，截断（`Limit`）和排序（`sortByEngagement`）的**执行顺序正好相反**：
+
+**Reddit：先截断，再排序**
+
+[redditWidget.update](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-reddit.go#L101-L117)
+
+```go
+posts, err := widget.fetchSubredditPosts()
+
+// 第一步：按 Reddit API 原生顺序截断到 Limit
+if len(posts) > widget.Limit {
+    posts = posts[:widget.Limit]
+}
+
+// 第二步：在截断后的子集里计算 engagement 并排序
+if widget.ExtraSortBy == "engagement" {
+    posts.calculateEngagement()
+    posts.sortByEngagement()
+}
+```
+
+**HackerNews：先排序，再截断**
+
+[hackerNewsWidget.update](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-hacker-news.go#L46-L63)
+
+```go
+posts, err := fetchHackerNewsPosts(widget.SortBy, 40, widget.CommentsUrlTemplate)
+
+// 第一步：在全部 40 条候选帖中计算 engagement 并排序
+if widget.ExtraSortBy == "engagement" {
+    posts.calculateEngagement()
+    posts.sortByEngagement()
+}
+
+// 第二步：在排序后的全量列表里截断到 Limit
+if widget.Limit < len(posts) {
+    posts = posts[:widget.Limit]
+}
+```
+
+**行为差异对比：**
+
+| 维度 | Reddit | HackerNews |
+|------|--------|------------|
+| 候选池大小 | `Limit` 条（通常 15） | 40 条（固定） |
+| 排序范围 | 仅在 API 返回的前 N 条内排序 | 在拉回的全量 40 条内排序 |
+| 风险 | API 原生排序靠后但实际高互动度的帖子会被提前截断丢弃，永远排不到前面 | 能从更大候选池中选出真正 engagement 最高的 Limit 条，结果更准确 |
+| 前提 | `calculateEngagement()` 使用的平均值基于截断后的子集，受截断影响 | 平均值基于 40 条全量，归一化更稳定 |
+
+Lobsters widget 的行为与 HackerNews 一致（先排序再截断），详见 [widget-lobsters.go#L47-L59](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-lobsters.go#L47-L59)。三个论坛 widget 此处行为不一致，Reddit 是特例。
 
 ## 八、关键文件索引
 
