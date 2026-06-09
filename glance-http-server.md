@@ -285,15 +285,50 @@ mux.HandleFunc("GET /manifest.json", func(w http.ResponseWriter, r *http.Request
 })
 ```
 
-- `a.parsedManifest`：每次 `newApplication()` 时用 `executeTemplateToString(manifestTemplate, templateData{App: app})` 重新渲染并存为 `[]byte`（热重载会重新渲染）。模板变量依赖 `AppName`、`AppBackgroundColor`、`AppIconURL` 等配置项，只有这些配置变化时 manifest 内容才实际变化。
+- `a.parsedManifest`：每次 `newApplication()` 时用 `executeTemplateToString(manifestTemplate, templateData{App: app})` 重新渲染并存为 `[]byte`（热重载会重新渲染）。
 - 模板中通过 `VersionedAssetPath("manifest.json")` 生成 URL：`/manifest.json?v=<CreatedAt.Unix()>`。
 
 > ServeMux 忽略查询字符串，`/manifest.json?v=1717900000` 仍命中 `GET /manifest.json`。`?v=` 参数用于 cache busting：由于 `a.CreatedAt = time.Now()` 在每次 `newApplication()` 时赋值，**每次热重载 `?v=` 都会变化**，即使 manifest 内容未变浏览器也会被强制重新请求。
+
+##### manifest.json 模板字段与 BaseURL 的关系
+
+模板源码：[templates/manifest.json](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/manifest.json)
+
+```json
+{
+    "name": "{{ .App.Config.Branding.AppName }}",
+    "display": "standalone",
+    "background_color": "{{ .App.Config.Branding.AppBackgroundColor }}",
+    "theme_color": "{{ .App.Config.Branding.AppBackgroundColor }}",
+    "scope": "/",
+    "start_url": "/",
+    "icons": [
+        {
+            "src": "{{ .App.Config.Branding.AppIconURL }}",
+            "type": "image/png",
+            "sizes": "512x512"
+        }
+    ]
+}
+```
+
+各字段的 BaseURL 处理：
+
+| 字段 | 值来源 | 受 BaseURL 影响？ | 子路径部署（`base-url: /glance`）下的问题 |
+|:---|:---|:---:|:---|
+| `name` | `AppName` 配置 | N/A | 无 |
+| `scope` | **硬编码 `"/"`** | ❌ 完全不感知 BaseURL | PWA 作用域覆盖整个站点而非 `/glance/`，可能与其他子路径 PWA 冲突 |
+| `start_url` | **硬编码 `"/"`** | ❌ 完全不感知 BaseURL | 从主屏启动时打开站点根路径（可能 404 或跳到其他应用），而非 `/glance/` |
+| `icons[].src` | `AppIconURL` 配置 | ⚠️ 默认值用 `StaticAssetPath`（正确）；用户自定义 `/assets/...` 时**不加 BaseURL** | 默认图标 URL 正确；用户自定义 `app-icon-url: /assets/icon.png` 时指向 `/assets/icon.png` 而非 `/glance/assets/icon.png`，404 |
+
+> **注意：无 Service Worker**。整个代码库未注册 `sw.js` 路由，因此 PWA 仅支持"添加到主屏幕"（standalone 模式启动），不支持离线缓存。
 
 关键代码：
 - `CreatedAt` 赋值：[newApplication()](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L47-L54)
 - manifest 渲染：[newApplication()](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L224-L228)
 - `VersionedAssetPath` URL 生成：[glance.go:431-434](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L431-L434)
+- `AppIconURL` 默认值与 BaseURL 缺失处理：[glance.go:216-218](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L216-L218)
+- HTML 中 manifest `<link>` 引用：[document.html:23](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/document.html#L23)
 
 #### (4) 用户自定义资源 `/assets/...`（2h 缓存，不限 HTTP 方法）
 
@@ -344,7 +379,7 @@ mux.Handle(
 |:---|:---|:---:|:---:|:---|
 | `/static/{hash}/...`（内嵌） | `staticFSHash`（包级 var，MD5 内嵌 FS） | ❌ | ✅ | 仅代码修改重新编译后变化；热重载时内嵌 FS 不变 |
 | `/static/{hash}/css/bundle.css` | `bundledCSSContents`（包级 var） | ❌ | ✅ | 同上 |
-| `/manifest.json?v=xxx` | `a.CreatedAt.Unix()`（每次 newApplication 赋值） | ✅ | ✅ | 仅当 Branding 配置（AppName/BackgroundColor/AppIconURL）变化时内容变 |
+| `/manifest.json?v=xxx` | `a.CreatedAt.Unix()`（每次 newApplication 赋值） | ✅ | ✅ | `scope` 和 `start_url` 硬编码为 `"/"` 永不变化；其余字段仅当 Branding 配置（AppName/BackgroundColor/AppIconURL）变化时内容变 |
 | `custom-css-file?v=xxx` | `a.CreatedAt.Unix()` | ✅ | ✅ | 与 CSS 文件是否修改**无关**；URL 变强制浏览器重取 |
 | `Branding.LogoURL`（用户自定义 `/assets/...`） | 无版本化，依赖 `/assets/` 的 2h Cache-Control | ❌ | ❌ | 文件系统实时读；浏览器缓存 2h；热重载后需手动清缓存或等 2h 过期 |
 | `Branding.FaviconURL`（用户自定义 `/assets/...`） | 同上 | ❌ | ❌ | 同上 |
@@ -408,6 +443,15 @@ mux.Handle(
 > 临时绕过方案：用户在配置中手动写全路径 `app-icon-url: /glance/assets/my-icon.png`，或使用外部绝对 URL。
 >
 > `app-icon-url` 同时出现在 HTML head 的 `<link rel="apple-touch-icon">` [document.html:22](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/document.html#L22) 和 PWA manifest 的 `icons[].src` [manifest.json:10](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/manifest.json#L10)，两处都会受此影响。
+
+> **⚠️ PWA `scope` / `start_url` 硬编码子路径部署陷阱：**
+> manifest 中 `scope` 和 `start_url` 在模板中硬编码为 `"/"` [manifest.json:6-7](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/manifest.json#L6-L7)，完全不感知 `base-url` 配置。
+>
+> 子路径部署（`base-url: /glance`）下的后果：
+> - `start_url: "/"`：用户从主屏启动 PWA 时打开 `https://domain/` 而非 `https://domain/glance/`，可能 404 或跳到其他应用
+> - `scope: "/"`：PWA 作用域声明为整个站点，若同域名下有多个子路径 PWA 可能冲突，浏览器可能认为页面"不在 PWA 作用域内"而拒绝添加到主屏幕
+>
+> 目前无配置层面的绕过方案，需修改模板源码。
 
 ---
 
