@@ -341,3 +341,139 @@ debouncedParseAndCompareBeforeCallback (500ms 防抖)
 | [glance.go](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/glance.go) | newApplication：默认值合并、认证/主题/页面二次初始化 |
 | [main.go](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/main.go) | CLI 入口、serveApp 热重载调度、校验/打印子命令 |
 | [widget.go](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go) | widgets 列表反序列化、widget 接口定义、基类 |
+| [auth.go](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/auth.go) | AUTH_SECRET_KEY_LENGTH 常量定义、会话 Token 生成与校验 |
+
+---
+
+## 10. 边界条件与两阶段校验/默认值深度分析
+
+代码 TODO ([config.go#L447-L450](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L447-L450)) 已明确指出当前校验分散在两处，以下将易混淆的边界条件按**阶段一（配置加载与解析，只读校验）**与**阶段二（应用初始化与运行时，可修改数据）**进行拆分梳理。
+
+### 10.1 认证 secret-key 的两阶段校验
+
+| 阶段 | 校验位置 | 校验内容 | 错误信息 | 原因说明 |
+|------|---------|---------|---------|---------|
+| 阶段一 | [isConfigStateValid#L456-L458](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L456-L458) | 当 `len(Auth.Users) > 0` 时，`SecretKey` **非空即可** | `"secret-key must be set when users are configured"` | 此阶段只做"存在性"预检，尚未解码，无法判断字节长度是否合法 |
+| 阶段二 | [newApplication#L61-L69](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/glance.go#L61-L69) | ① Base64 解码成功；② 解码后字节数必须精确等于 `AUTH_SECRET_KEY_LENGTH`(64 字节) | `"decoding secret-key: ..."` 或 `"secret-key must be exactly 64 bytes"` | 常量定义：`AUTH_SECRET_KEY_LENGTH = AUTH_TOKEN_SECRET_LENGTH(32) + AUTH_USERNAME_HASH_LENGTH(32)`，来自 [auth.go#L27-L29](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/auth.go#L27-L29)。后续 `generateSessionToken`/`computeUsernameHash`/`verifySessionToken` 均依赖该长度做切片（如 `secret[AUTH_TOKEN_SECRET_LENGTH:]`），长度错误会导致越界 |
+
+**易混淆点**：为什么不在阶段一就校验长度？
+- 阶段一是纯 YAML 层面的逻辑校验，不解码、不依赖加密模块
+- Base64 解码属于"数据变换"范畴，归入阶段二的初始化流程
+- 两阶段分离使得 `glance --config-validate` CLI 命令（仅调用阶段一）可以不依赖 auth 子系统的全部逻辑
+
+---
+
+### 10.2 页面标识（Slug）与 full 列约束的两阶段处理
+
+#### 10.2.1 Full 列约束
+
+| 阶段 | 校验位置 | 内容 | 原因说明 |
+|------|---------|------|---------|
+| 阶段一 | [isConfigStateValid#L503-L533](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L503-L533) | ① slim 页面列数 ≤ 2，其他 ≤ 3；② 每列 size 只能是 small/full；③ **full 列数量必须为 1 或 2** | 这些是纯静态约束，与运行时逻辑无关，应在 YAML 层面拦截 |
+| 阶段二 | [newApplication#L155 + L181-L186](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/glance.go#L155-L186) | ① `PrimaryColumnIndex` 初始化为 -1；② 遍历列时遇到 **第一个 size=full** 的列，将其下标赋值给 `PrimaryColumnIndex` | `PrimaryColumnIndex` 是运行时字段（`yaml:"-"`），不参与 YAML 序列化。之所以选"第一个 full 列"，是因为阶段一已经保证至少有 1 个 full 列，无需再判空 |
+
+**易混淆点**：阶段一已保证 full ∈ {1,2}，阶段二为什么只取第一个？
+- 前端渲染时"主列"只需一个锚点（通常放主要内容），第二个 full 列作为辅助
+- 若需要多主列语义，应由布局 CSS 处理，此处 `PrimaryColumnIndex` 仅用于内部逻辑定位
+
+#### 10.2.2 页面 Slug 处理
+
+| 阶段 | 处理位置 | 内容 | 原因说明 |
+|------|---------|------|---------|
+| 阶段一 | 无 | 阶段一对 Slug **完全不校验** | Slug 是可选项（由 title 派生），且需要 title→slug 转换函数，归入初始化阶段更合适 |
+| 阶段二 | [newApplication#L157-L165](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/glance.go#L157-L165) | ① Slug 为空时用 `titleToSlug(page.Title)` 自动生成；② 检查 Slug 是否命中保留字 `["login", "logout"]`（[glance.go#L28](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/glance.go#L28)）；③ 将 `""` 映射到第一页、各 slug 映射到对应 page，写入 `slugToPage` | 保留字冲突只能在"派生完成后"检测，因为用户没写 slug 时需要先从 title 算出来才知道是否冲突。`slugToPage[""]` 指向第一页，实现根路径 `/` 默认访问第一页的路由语义 |
+
+**易混淆点**：阶段一校验了 page.Title 非空，为什么不同时校验 Slug？
+- Slug 具有"可派生"属性——没有 Slug 并不一定是错误，可以从 Title 自动生成
+- 保留字列表与路由系统耦合，放在阶段二（和路由注册一起）职责更内聚
+
+---
+
+### 10.3 热重载：首次启动 vs 运行中报错的分流逻辑
+
+[serveApp](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/main.go#L93-L181) 用一个布尔标志 `hadValidConfigOnStartup` 控制错误分流。
+
+#### 状态流转图
+
+```
+serveApp() 启动
+   │
+   ├─ parseYAMLIncludes() 失败 ──→ return error（进程直接退出，无日志分流）
+   │
+   ├─ configFilesWatcher() 初始化失败 ──→ 降级路径：
+   │     ├─ newConfigFromYAML() 失败 → return error
+   │     ├─ newApplication() 失败    → return error
+   │     └─ startServer()            → 启动成功但无热重载
+   │
+   └─ configFilesWatcher() 初始化成功：
+         └─ 立即触发 onChange(初始内容)
+              │
+              ├─ hadValidConfigOnStartup == false（首次）
+              │    ├─ newConfigFromYAML/newApplication 失败 → close(exitChannel) → 进程退出
+              │    └─ 成功 → hadValidConfigOnStartup = true，启动 server
+              │
+              └─ hadValidConfigOnStartup == true（运行中变更）
+                   ├─ newConfigFromYAML/newApplication 失败 → log.Printf 打日志，return，保留旧 server
+                   └─ 成功 → stopServer() → 启动新 server
+```
+
+#### 分流原因分析
+
+| 场景 | 处理策略 | 原因 |
+|------|---------|------|
+| **首次启动加载失败** | 立即退出（关闭 exitChannel → `<-exitChannel` 返回 → serveApp return） | 启动时连合法配置都没有，服务无法提供任何功能，快速失败便于用户发现 |
+| **运行中变更失败** | 仅打日志，保留旧配置 | 热重载的核心价值是"不中断服务"，旧配置仍然有效时应继续运行，让用户有机会修正错误 |
+| **文件监视器初始化失败** | 降级为单次加载成功即启动 | fsnotify 在某些环境（容器、特定 FS）可能不可用，但配置本身合法，不应因此阻止服务启动 |
+| **Include 解析首次失败** | 在 serveApp 开头直接 return error（不进入 onChange） | `parseYAMLIncludes` 在 watcher 启动前同步执行，还没有 `hadValidConfigOnStartup` 标志，统一走错误返回 |
+
+**易混淆点**：为什么 watcher 初始化失败的降级路径里 `startServer, _ := app.server()` 忽略了 stopServer？
+- 降级路径是同步启动（无 go func），服务阻塞在 `ListenAndServe` 上
+- 降级意味着没有热重载，服务不会被中途停止，所以不需要 stop 函数
+- 正常路径（有 watcher）是异步 goroutine 启动，需要 stopServer 句柄用于配置变更时优雅重启
+
+---
+
+### 10.4 Widget 反序列化报错定位精确分析
+
+[widgets.UnmarshalYAML](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L95-L124) 有 4 个可能的错误返回点，行号信息的完整性各不相同：
+
+| 序号 | 代码位置 | 错误场景 | 是否携带行号 | 错误示例 | 原因说明 |
+|------|---------|---------|------------|---------|---------|
+| ① | [L98-L100](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L98-L100) | `node.Decode(&nodes)` 失败（widgets 根节点不是数组） | 否（yaml 库自带位置） | `yaml: unmarshal errors: line 12: cannot unmarshal !!map into []yaml.Node` | 外层 YAML 解析器已记录 token 位置，通常自带行号 |
+| ② | [L107-L109](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L107-L109) | 单个 widget 节点 Decode meta 失败（如 type 字段类型不对） | 否（yaml 库自带位置） | `yaml: unmarshal errors: line 15: cannot unmarshal !!int into string` | 同上，yaml.v3 内部错误已包含行号 |
+| ③ | [L111-L114](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L111-L114) | `newWidget(meta.Type)` 失败（type 为空或未知） | **是，手动拼接** `fmt.Errorf("line %d: %w", node.Line, err)` | `line 17: unknown widget type: foobar` | `newWidget` 返回的是纯语义错误（无 YAML 位置），必须手动追加 `node.Line`。注意这个 `node.Line` 是**列表项节点的起始行**（即 `- type: xxx` 的 `-` 所在行），不一定是 `type:` 字段所在行 |
+| ④ | [L116-L118](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L116-L118) | `node.Decode(widget)` 失败（具体 widget 字段类型错误） | 否（yaml 库自带位置） | `yaml: unmarshal errors: line 20: cannot unmarshal !!str into int` | 具体 widget 结构体解码由 yaml.v3 负责，错误会精确到字段行号 |
+
+#### 阶段一后续：Widget initialize() 错误包装
+
+反序列化成功后，在 [newConfigFromYAML#L112-L126](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L112-L126) 逐个调用 `widget.initialize()`：
+
+```go
+if err := config.Pages[p].HeadWidgets[w].initialize(); err != nil {
+    return nil, formatWidgetInitError(err, config.Pages[p].HeadWidgets[w])
+}
+```
+
+[formatWidgetInitError](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L236-L238) 将错误包装为 `<widget-type> widget: <原始错误>`，**但丢失了行号**——因为此时 widget 结构体已完成反序列化，不再持有原始 `yaml.Node` 的行号信息。
+
+**易混淆点**：为什么③必须手动加行号而①②④不用？
+- ①②④的错误来自 `yaml.Node.Decode()` 内部，yaml.v3 在解析 token 时已记录源位置，错误信息自动包含 `line N`
+- ③的错误来自 Go 代码的 switch 分支（`newWidget` 工厂），与 YAML token 无关，必须通过闭包捕获外层 `node.Line` 手动拼接
+- 这也解释了为什么 `initialize()` 阶段无法再给出行号——widget 接口里没有 `Line()` 方法，YAML 节点信息在反序列化完成后已丢弃
+
+---
+
+### 10.5 两阶段边界条件汇总表
+
+| 关注点 | 阶段一（newConfigFromYAML + isConfigStateValid） | 阶段二（newApplication + serveApp onChange） |
+|--------|------------------------------------------------|----------------------------------------------|
+| **Auth secret-key** | ✅ 非空校验（有 users 时必须存在） | ✅ Base64 解码 + 精确 64 字节长度校验 + 密码哈希 |
+| **Full 列约束** | ✅ 列数上限 + size 枚举 + full∈{1,2} | ✅ PrimaryColumnIndex = 第一个 full 列下标（-1 兜底） |
+| **Page Slug** | ❌ 不处理 | ✅ 空则 titleToSlug 派生 + 保留字(login/logout)检查 + slugToPage 建索引 |
+| **页面 Width** | ✅ 枚举校验（wide/slim/default/空） | ✅ "default" → 置空归一化 |
+| **DesktopNavigationWidth** | ✅ 枚举校验（非空时） | ✅ 空则继承 page.Width |
+| **热重载错误分流** | ❌ 不涉及运行时 | ✅ hadValidConfigOnStartup 标志：首次失败退出、运行时失败保留旧配置 |
+| **Widget 反序列化** | ✅ 4 处错误点，仅 newWidget 失败手动加行号 | ✅ initialize() 错误包装为 type 前缀，但丢失行号 |
+| **默认值 Port** | ✅ Server.Port = 8080（Unmarshal 前硬编码） | — |
+| **默认值 Branding** | — | ✅ AppName/Favicon/AppIcon/BackgroundColor 派生默认值 |
+| **主题预设** | — | ✅ 内置 default-dark/light 与用户 presets 合并，用户值覆盖内置值 |
