@@ -478,3 +478,344 @@ newApplication(config)
     ↓
 server() → 注册路由 → ListenAndServe
 ```
+
+---
+
+## 八、配置热重载机制
+
+### 8.1 整体架构
+
+Glance 支持配置文件（含所有 include 的文件）变更时自动热重载，无需重启进程。核心由三部分协作：
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│  serveApp()  [main.go]                                         │
+│                                                               │
+│  parseYAMLIncludes() ── 首次解析，获取初始内容和 include 集合   │
+│          │                                                    │
+│          ▼                                                    │
+│  configFilesWatcher() ── 启动 fsnotify 监听所有相关文件        │
+│          │                                                    │
+│          ├── onChange(newContents)                            │
+│          │     └── 成功 → 停旧服务 → 创建新 app → 启新服务     │
+│          │     └── 失败 → 记录日志 → 维持旧服务运行（见第九节） │
+│          │                                                    │
+│          └── onErr(err)                                       │
+│                └── 仅记录日志，不中断服务                      │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 serveApp 启动流程
+
+[internal/glance/main.go:93-181](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/main.go#L93-L181) 是服务启动和热重载的总控函数：
+
+```go
+func serveApp(configPath string) error {
+    exitChannel := make(chan struct{})     // 进程退出信号
+    hadValidConfigOnStartup := false       // ← 关键状态标志
+    var stopServer func() error            // 当前运行服务的停止函数
+
+    // ── onChange：配置变更回调 ──
+    onChange := func(newContents []byte) {
+        // 详见第九节
+    }
+
+    // ── onErr：文件监听错误回调 ──
+    onErr := func(err error) {
+        log.Printf("Error watching config files: %v", err)
+    }
+
+    // ── 首次解析配置 ──
+    configContents, configIncludes, err := parseYAMLIncludes(configPath)
+    if err != nil {
+        return fmt.Errorf("parsing config: %w", err)
+    }
+
+    // ── 启动文件监听器 ──
+    stopWatching, err := configFilesWatcher(configPath, configContents, configIncludes, onChange, onErr)
+    if err == nil {
+        defer stopWatching()               // 正常：通过热重载启动
+    } else {
+        // 降级路径：监听器启动失败（如 fsnotify 不支持）
+        // 跳过热重载，直接加载配置启动一次
+        log.Printf("Error starting file watcher, config file changes will require a manual restart. (%v)", err)
+
+        config, err := newConfigFromYAML(configContents)
+        if err != nil {
+            return fmt.Errorf("validating config file: %w", err)
+        }
+        app, err := newApplication(config)
+        if err != nil {
+            return fmt.Errorf("creating application: %w", err)
+        }
+        startServer, _ := app.server()
+        if err := startServer(); err != nil {
+            return fmt.Errorf("starting server: %w", err)
+        }
+    }
+
+    <-exitChannel   // 阻塞等待退出信号
+    return nil
+}
+```
+
+### 8.3 configFilesWatcher 文件监听详解
+
+[config.go:305-445](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/config.go#L305-L445) 实现了复杂的文件监听逻辑：
+
+#### 核心状态
+
+```go
+func configFilesWatcher(
+    mainFilePath string,
+    lastContents []byte,           // 上次成功的合并内容（用于内容对比）
+    lastIncludes map[string]struct{},  // 上次监听的文件集合（用于动态增删监听）
+    onChange func(newContents []byte),
+    onErr func(error),
+) (func() error, error)
+```
+
+#### 防抖机制
+
+```go
+const debounceDuration = 500 * time.Millisecond
+var debounceTimer *time.Timer
+
+debouncedParseAndCompareBeforeCallback := func() {
+    if debounceTimer != nil {
+        debounceTimer.Stop()
+        debounceTimer.Reset(debounceDuration)  // 重置计时器
+    } else {
+        debounceTimer = time.AfterFunc(debounceDuration, parseAndCompareBeforeCallback)
+    }
+}
+```
+
+目的：编辑器保存文件时可能触发多次 Write 事件（如 atomic rename 会写临时文件再 rename），500ms 防抖避免重复解析。
+
+#### 内容对比与监听集合动态更新
+
+```go
+parseAndCompareBeforeCallback := func() {
+    // 重新解析所有 include，得到最新内容和文件集合
+    currentContents, currentIncludes, err := parseYAMLIncludes(mainFilePath)
+    // ...
+
+    mu.Lock()
+    defer mu.Unlock()
+
+    // 如果 include 集合变了（新增或删除了 include 文件）
+    if !maps.Equal(currentIncludes, lastIncludes) {
+        updateWatchedFiles(lastIncludes, currentIncludes)  // 增删 watcher
+        lastIncludes = currentIncludes
+    }
+
+    // 只有文件内容真正变化才触发 onChange
+    if !bytes.Equal(lastContents, currentContents) {
+        lastContents = currentContents
+        onChange(currentContents)
+    }
+}
+```
+
+**二级对比策略**：
+1. **Include 集合对比**：用户新增/删除 `$include` 引用时，动态更新 fsnotify 监听的文件列表
+2. **内容字节对比**：避免 include 文件没变但主文件时间戳变化（或其他无意义变更）触发无效重载
+
+#### 文件事件处理
+
+```go
+case event.Has(fsnotify.Write):
+    debouncedParseAndCompareBeforeCallback()       // 防抖后解析
+
+case event.Has(fsnotify.Rename):
+    deleteLastInclude(event.Name)                  // 从 tracked set 移除旧路径
+    // 等 2 秒（10 × 200ms）看文件会不会重新出现（编辑器 atomic save 的典型行为）
+    for range 10 {
+        if _, err := os.Stat(event.Name); err == nil { break }
+        time.Sleep(200 * time.Millisecond)
+    }
+    debouncedParseAndCompareBeforeCallback()
+
+case event.Has(fsnotify.Remove):
+    deleteLastInclude(event.Name)
+    debouncedParseAndCompareBeforeCallback()
+```
+
+**Rename 事件的特殊处理**：
+- Linux 下，很多编辑器使用"写临时文件 + rename 覆盖"的原子保存方式
+- Rename 后 fsnotify 在 Linux 上会丢失对原路径的监听
+- 代码主动等待 2 秒看文件是否重新出现，然后触发重新解析（重新解析时会重新添加新文件到 watcher）
+
+---
+
+## 九、校验失败时维持旧状态的处理流程
+
+### 9.1 核心设计目标
+
+热重载过程中，如果用户提交了一份有错误的配置（语法错误、字段不合法、widget 初始化失败等），**不能让正在运行的服务崩溃或停止**。必须保证：
+
+1. 首次启动就配置错误 → 进程直接退出（无可维持的旧状态）
+2. 运行中配置变更出错 → 仅记录日志，旧服务继续运行，等用户修复后再次变更时再尝试重载
+
+### 9.2 onChange 回调的状态机
+
+[internal/glance/main.go:101-146](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/main.go#L101-L146) 中 `onChange` 的完整逻辑：
+
+```go
+onChange := func(newContents []byte) {
+    if stopServer != nil {
+        log.Println("Config file changed, reloading...")
+    }
+
+    // ── 关卡 1：解析 + 校验配置 ──
+    config, err := newConfigFromYAML(newContents)
+    if err != nil {
+        log.Printf("Config has errors: %v", err)
+
+        if !hadValidConfigOnStartup {   // ← 关键判断
+            close(exitChannel)           // 首次启动失败 → 退出进程
+        }
+        return                          // 运行中失败 → 直接 return，不碰旧服务
+    }
+
+    // ── 关卡 2：创建 application（二次校验 + 初始化） ──
+    app, err := newApplication(config)
+    if err != nil {
+        log.Printf("Failed to create application: %v", err)
+
+        if !hadValidConfigOnStartup {
+            close(exitChannel)
+        }
+        return
+    }
+
+    // ── 成功：更新状态 ──
+    if !hadValidConfigOnStartup {
+        hadValidConfigOnStartup = true   // 标记首次成功，后续永远走"维持旧状态"分支
+    }
+
+    // ── 关卡 3：优雅切换 ──
+    if stopServer != nil {
+        if err := stopServer(); err != nil {   // 先停旧服务
+            log.Printf("Error while trying to stop server: %v", err)
+        }
+    }
+
+    // 启动新服务（goroutine，因为 ListenAndServe 是阻塞的）
+    go func() {
+        var startServer func() error
+        startServer, stopServer = app.server()   // 更新 stopServer 到新服务的
+
+        if err := startServer(); err != nil {
+            log.Printf("Failed to start server: %v", err)
+        }
+    }()
+}
+```
+
+### 9.3 hadValidConfigOnStartup 标志的语义
+
+这个布尔标志是整个容错机制的核心：
+
+| 值 | 含义 | 校验失败时行为 |
+|----|------|-------------|
+| `false` | 进程启动后尚未有过任何一份有效配置成功运行 | `close(exitChannel)` → 进程退出，返回非零码 |
+| `true` | 至少有一份有效配置已经成功启动过服务 | 仅 `log.Printf` 记录错误，`return` 跳过本次变更，旧服务继续运行 |
+
+**状态转换**：`false` → `true` 是单向的，一旦变为 `true` 就永远不会回到 `false`。这意味着只要服务曾经成功启动过一次，之后任何配置错误都不会导致进程退出。
+
+### 9.4 完整状态转换图
+
+```
+                        ┌───────────────┐
+                        │  进程启动     │
+                        └───────┬───────┘
+                                │
+                    hadValidConfigOnStartup = false
+                                │
+                                ▼
+                  onChange 被首次触发（由 watcher 启动时调用）
+                                │
+                    ┌───────────┴───────────┐
+                    ▼                       ▼
+              解析/校验成功             解析/校验失败
+                    │                       │
+     hadValidConfigOnStartup = true    close(exitChannel)
+           startServer()                     进程退出
+                    │
+                    ▼
+              ┌──────────┐
+              │ 服务运行 │ ◄──────────┐
+              └────┬─────┘            │
+                   │                  │
+         用户修改配置文件              │
+                   │                  │
+                   ▼                  │
+        fsnotify 触发 onChange        │
+                   │                  │
+          ┌────────┴────────┐         │
+          ▼                 ▼         │
+      成功              校验失败       │
+          │                 │         │
+   stopServer()      log 错误 ────────┘
+   创建新 app
+   startServer()
+          │
+          ▼
+     继续运行（新配置）
+```
+
+### 9.5 资源生命周期管理
+
+切换过程中的资源清理：
+
+```go
+if stopServer != nil {
+    if err := stopServer(); err != nil {
+        log.Printf("Error while trying to stop server: %v", err)
+    }
+}
+// 旧的 *application 对象失去引用，由 GC 回收
+// 旧的 widget、http.Server、监听器等都随 stopServer() 关闭
+
+go func() {
+    startServer, stopServer = app.server()   // stopServer 变量被覆盖为新函数
+    startServer()
+}()
+```
+
+注意事项：
+- `stopServer` 是闭包捕获的变量，始终指向当前运行服务的停止函数
+- 旧服务 `stopServer()` 调用 `http.Server.Close()`，会关闭所有 listener 并等待活跃请求完成
+- 旧 `application` 对象及其所有 widget 缓存、主题配置等变为不可达，由 Go GC 回收
+- `stopWatching` 通过 `defer` 在 `serveApp` 返回时调用（即进程退出时）
+
+### 9.6 降级路径下的容错
+
+当 `configFilesWatcher` 本身启动失败（如某些不支持 inotify 的环境），代码走降级路径：
+
+```go
+} else {
+    log.Printf("Error starting file watcher, config file changes will require a manual restart. (%v)", err)
+
+    // 直接加载一次配置，不支持热重载
+    config, err := newConfigFromYAML(configContents)
+    if err != nil {
+        return fmt.Errorf("validating config file: %w", err)  // 启动失败直接返回错误
+    }
+    app, err := newApplication(config)
+    if err != nil {
+        return fmt.Errorf("creating application: %w", err)
+    }
+    startServer, _ := app.server()
+    if err := startServer(); err != nil {
+        return fmt.Errorf("starting server: %w", err)
+    }
+}
+```
+
+降级路径下：
+- 无热重载，`hadValidConfigOnStartup` 逻辑不生效
+- 首次启动失败直接返回 error → 进程退出
+- 一旦启动成功就一直运行，直到进程被外部终止
