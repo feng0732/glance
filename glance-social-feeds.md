@@ -338,7 +338,7 @@ if err == nil && !w.ContentAvailable {
 
 ## 七、互动度二次排序（Extra Sort）
 
-三个论坛 widget 均支持 `extra-sort-by: engagement`。
+⚠️ **只有 Reddit 和 HackerNews 支持 `extra-sort-by: engagement`。Lobsters widget 不支持该功能**——它的结构体里没有 `ExtraSortBy` 字段（[widget-lobsters.go#L11-L21](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-lobsters.go#L11-L21)），`update()` 方法中也完全没有调用 `calculateEngagement()` / `sortByEngagement()` 的逻辑（[widget-lobsters.go#L47-L59](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-lobsters.go#L47-L59)）。
 
 ### 7.1 基础互动度
 
@@ -352,6 +352,31 @@ Engagement = (CommentCount / averageComments + Score / averageScore) / 2
 ```
 
 以所有帖子的平均值为归一化基准，评论数和点赞数各占 50% 权重。
+
+**⚠️ 除零边界：平均评论/分数为 0 时的行为**
+
+代码没有对 `averageComments == 0` 或 `averageScore == 0` 做任何保护，直接进行 float64 除法。Go 语言中浮点数除零的行为：
+
+- `正数 / +0.0` → `+Inf`（正无穷）
+- `0.0 / 0.0` → `NaN`（Not a Number）
+
+具体到 engagement 公式：
+
+| 场景 | CommentCount / AvgComments | Score / AvgScore | Engagement 结果 |
+|------|---------------------------|-----------------|----------------|
+| 所有帖评论=0，所有帖分数=0 | 0/0 = NaN | 0/0 = NaN | **NaN** |
+| 所有帖评论=0，某帖分数>0，其余=0 | 0/0 = NaN | x/0 = +Inf | **NaN**（NaN 参与任何运算仍为 NaN） |
+| 所有帖评论=0，某帖评论>0，其余=0 | x/0 = **+Inf** | 0/0 = NaN | **NaN** |
+| 平均评论=0，所有帖分数>0（平均分数>0） | 0/0 = NaN | 正常值 | **NaN** |
+| 平均分数=0，所有帖评论>0（平均评论>0） | 正常值 | 0/0 = NaN | **NaN** |
+| 平均评论=0，仅 1 条帖有评论（其余=0），分数都正常 | x/0 = **+Inf** | 正常值 | **+Inf** |
+
+后两种场景中只要有一个维度的平均值为 0，就会出现 `0/0 = NaN`，从而整体 Engagement 变成 NaN。`sort.Slice` 中 `NaN > x` 对任何 x 都返回 `false`，`NaN > NaN` 也返回 `false`，导致排序结果**不可预测**（NaN 帖子可能出现在列表任意位置）。
+
+现实中出现的典型场景：
+- 新建 subreddit 或 HN 分类下全是新帖，所有帖都是 0 评论 0 分
+- Reddit 的 `show-flairs: false` 或过滤后只剩无人互动的帖子
+- 数据拉取出现 `errPartialContent`，成功拿到的几条恰好全是 0 互动
 
 ### 7.2 时间折旧（代码真实行为）
 
@@ -464,7 +489,7 @@ if widget.Limit < len(posts) {
 | 风险 | API 原生排序靠后但实际高互动度的帖子会被提前截断丢弃，永远排不到前面 | 能从更大候选池中选出真正 engagement 最高的 Limit 条，结果更准确 |
 | 前提 | `calculateEngagement()` 使用的平均值基于截断后的子集，受截断影响 | 平均值基于 40 条全量，归一化更稳定 |
 
-Lobsters widget 的行为与 HackerNews 一致（先排序再截断），详见 [widget-lobsters.go#L47-L59](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-lobsters.go#L47-L59)。三个论坛 widget 此处行为不一致，Reddit 是特例。
+⚠️ **Lobsters widget 完全不支持 engagement 排序**，它的 `update()` 方法中不存在任何 `ExtraSortBy` 分支（[widget-lobsters.go#L47-L59](file:///d:/fz/0601/solo-dogfeeding/code/137-glance/internal/glance/widget-lobsters.go#L47-L59)），所有帖子始终按 API 原生顺序输出后直接截断。因此"截断 vs 排序"的行为差异只存在于 Reddit 与 HackerNews 之间。
 
 ## 八、关键文件索引
 
