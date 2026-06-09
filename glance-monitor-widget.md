@@ -485,3 +485,293 @@ scheduleNextUpdate() 或 scheduleEarlyUpdate()
 | 状态判定 | AltStatusCodes 白名单 + Code>=400/Error | 灵活适配非标准部署（如 401 表示需要登录但服务正常） |
 | URL 分离 | CheckURL vs DefaultURL vs ErrorURL | 探测地址、展示链接、失败跳转三者解耦 |
 | 结果保序 | 通过 index 回填切片 | 保证渲染顺序与配置顺序一致 |
+
+---
+
+## 十、边界条件深度解析
+
+### 10.1 三种异常场景的本质区别
+
+`siteStatus` 的三个字段 `Code`、`TimedOut`、`Error` 组合出三种完全不同的异常路径，它们的触发来源和后续处理截然不同：
+
+| 场景 | `Code` | `TimedOut` | `Error` | 触发来源 |
+|------|--------|------------|---------|----------|
+| 请求报错（非超时） | `0`（int 零值） | `false` | `!nil` | DNS 解析失败、TCP 连接拒绝、TLS 握手失败、证书校验失败等 |
+| **超时** | `0`（int 零值） | `true` | `!nil` | `context.DeadlineExceeded`（请求级或 Client 级超时） |
+| **HTTP 状态异常** | `>=400` | `false` | `nil` | 服务端返回了 4xx/5xx 响应，但 HTTP 请求本身成功 |
+
+**关键区分点**：HTTP 状态异常（如 502 Bad Gateway）虽然在语义上是"服务不可用"，但从代码层面看 `Error == nil`，因为 TCP/TLS 握手和 HTTP 传输都成功完成了，只是业务层返回了错误码。这个差异会传导到后续所有处理逻辑。
+
+参考 [fetchSiteStatusTask()](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget-monitor.go#L135-L183) 的错误分支：
+```go
+if err != nil {
+    if errors.Is(err, context.DeadlineExceeded) {
+        status.TimedOut = true
+    }
+    status.Error = err
+    return status, nil   // Code 保持零值 0
+}
+// 只有走到这里 Code 才被赋值
+defer response.Body.Close()
+status.Code = response.StatusCode
+```
+
+---
+
+### 10.2 失败跳转地址 ErrorURL 的精确触发条件
+
+位置：[widget-monitor.go#L67-L71](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget-monitor.go#L67-L71)
+
+```go
+if status.Error != nil && site.ErrorURL != "" {
+    site.URL = site.ErrorURL
+} else {
+    site.URL = site.DefaultURL
+}
+```
+
+**真值表**：
+
+| 场景 | `status.Error` | `site.ErrorURL` | 最终跳转 URL |
+|------|----------------|-----------------|--------------|
+| 正常响应 200 | nil | 任意 | `DefaultURL` |
+| HTTP 404/500 等 | nil | 已配置 | `DefaultURL` |
+| HTTP 404/500 等 | nil | 未配置 | `DefaultURL` |
+| 请求报错（DNS 失败等） | !nil | 已配置 | **`ErrorURL`** |
+| 请求报错（DNS 失败等） | !nil | 未配置 | `DefaultURL` |
+| 超时 | !nil | 已配置 | **`ErrorURL`** |
+| 超时 | !nil | 未配置 | `DefaultURL` |
+
+**容易踩坑的边界**：HTTP 502/503/504 这类典型的"服务挂了"状态码，**不会**触发 ErrorURL 跳转，因为 `Error` 仍为 nil。如果希望这些状态码也跳转到备用地址，需要自行在 ErrorURL 上游做处理，或通过配置反向代理把故障转为 TCP 层面的连接失败。
+
+---
+
+### 10.3 刷新调度的真实触发逻辑
+
+刷新调度由 [canContinueUpdateAfterHandlingErr()](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget.go#L293-L325) 控制，但这里存在一个极易误解的点：
+
+#### 调度决策路径
+
+```
+fetchStatusForSites(requests)
+        │
+        ▼
+  返回 (results, err)
+        │
+        ▼
+  canContinueUpdateAfterHandlingErr(err)
+        │
+        ├── err == nil  → scheduleNextUpdate()   正常5分钟后刷新
+        └── err != nil  → scheduleEarlyUpdate()  指数退避重试
+```
+
+#### 关键问题：`fetchStatusForSites` 什么时候返回 err？
+
+追踪调用链：
+
+```
+fetchStatusForSites()
+  → workerPoolDo(job)         返回 (results, errs, err)
+     → 只有 job.ctx.Done() 触发时，第三个返回值 err 才非 nil
+```
+
+位置：[widget-utils.go#L214-L234](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget-utils.go#L214-L234)
+
+```go
+var err error
+go func() {
+loop:
+    for i := range job.data {
+        select {
+        default:
+            tasksQueue <- ...
+        case <-job.ctx.Done():
+            err = job.ctx.Err()   // ← 唯一赋值点
+            break loop
+        }
+    }
+    ...
+}()
+```
+
+而 `newJob()` 创建 job 时使用的是 `context.Background()`：
+
+```go
+func newJob[I any, O any](task func(I) (O, error), data []I) *workerPoolJob[I, O] {
+    return &workerPoolJob[I, O]{
+        ...
+        ctx: context.Background(),   // ← 永不取消的 context
+    }
+}
+```
+
+#### 结论
+
+| 故障场景 | `fetchStatusForSites` 返回 err | 调度行为 |
+|----------|-------------------------------|----------|
+| 单个站点超时 | **否** | 正常 5 分钟刷新 |
+| 单个站点 DNS 失败 | **否** | 正常 5 分钟刷新 |
+| 单个站点返回 500 | **否** | 正常 5 分钟刷新 |
+| 所有站点全部超时 | **否** | 正常 5 分钟刷新 |
+| Worker Pool context 被取消（极罕见） | **是** | 指数退避重试 |
+
+**设计要点**：Monitor Widget 采用的是"**结果内聚错误**"模型——每个站点的错误存储在各自 `siteStatus.Error` 中，由上层 UI 逐站展示；Worker Pool 层面的错误（即 `fetchStatusForSites` 返回的 err）仅用于表示"整个调度框架出了问题"，而非"被监控站点出了问题"。因此**被监控的站点故障永远不会触发 early update**，始终按 5 分钟正常周期刷新。
+
+---
+
+### 10.4 模板层展示分支详解
+
+#### 10.4.1 标准模式分支逻辑
+
+位置：[monitor.html#L29-L37](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/templates/monitor.html#L29-L37)
+
+```html
+{{ if not .Status.Error }}
+    <!-- 分支 A：无请求错误 -->
+    <li title="{{ .Status.Code }}">{{ .StatusText }}</li>
+    <li>{{ .Status.ResponseTime.Milliseconds | formatNumber }}ms</li>
+{{ else if .Status.TimedOut }}
+    <!-- 分支 B：超时（Error != nil 且 TimedOut == true） -->
+    <li class="color-negative">Timed Out</li>
+{{ else }}
+    <!-- 分支 C：其他请求错误（Error != nil 且 TimedOut == false） -->
+    <li class="color-negative" title="{{ .Status.Error }}">ERROR</li>
+{{ end }}
+```
+
+**各场景展示效果**：
+
+| 场景 | 走哪个分支 | 状态文本 | 响应时间 | 右侧图标颜色 |
+|------|-----------|----------|----------|-------------|
+| 正常 200 | A | `OK` | `123ms` | 绿色 |
+| HTTP 404 | A | `Not Found` | `45ms` | 红色 |
+| HTTP 502 | A | `Server Error` | `89ms` | 红色 |
+| HTTP 401 + AltStatusCodes=[401] | A | `OK` | `34ms` | 绿色 |
+| 超时 | B | `Timed Out`（红色） | **不显示** | 红色 |
+| DNS 解析失败 | C | `ERROR`（红色，悬浮看详情） | **不显示** | 红色 |
+| TLS 证书错误 | C | `ERROR`（红色，悬浮看详情） | **不显示** | 红色 |
+
+**注意**：HTTP 状态异常（>=400）虽然在业务上是故障，但在模板层走分支 A，仍会显示响应时间，这是因为 TCP 请求确实完成了。
+
+#### 10.4.2 紧凑模式分支差异
+
+位置：[monitor-compact.html#L23-L38](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/templates/monitor-compact.html#L23-L38)
+
+紧凑模式只做两个判断：
+
+```html
+{{ if not .Status.TimedOut }}<div>...ms</div>{{ end }}
+{{ if eq .StatusStyle "ok" }}
+    <div ... title="{{ .Status.Code }}">
+{{ else }}
+    <div ... title="{{ if .Status.Error }}{{ .Status.Error }}{{ else }}{{ .Status.Code }}{{ end }}">
+```
+
+与标准模式的关键差异：
+
+| 差异点 | 标准模式 | 紧凑模式 |
+|--------|---------|---------|
+| 响应时间显示条件 | `not .Status.Error` | `not .Status.TimedOut` |
+| DNS 失败时 | 不显示响应时间 | **显示响应时间** |
+| TLS 错误时 | 不显示响应时间 | **显示响应时间** |
+| 超时时 | 不显示响应时间 | 不显示响应时间 |
+| 状态 tooltip 内容 | 分支 A:Code，分支 B/C:无 | ok:Code，error:优先 Error 其次 Code |
+
+**紧凑模式的小瑕疵**：非超时的请求错误（如 DNS 失败）也会显示响应时间，但这个时间实际上是从请求发起到底层报错的耗时（通常很短，如几毫秒），参考意义有限。标准模式在这个处理上更严谨。
+
+#### 10.4.3 ShowFailingOnly 与 HasFailing 的联动
+
+```
+外层判断 {{ if not (and .ShowFailingOnly (not .HasFailing)) }}
+    │
+    ├── ShowFailingOnly=false → 始终渲染完整列表
+    │
+    └── ShowFailingOnly=true
+            │
+            ├── HasFailing=true → 渲染列表，内层 {{ if eq .StatusStyle "ok" }} 过滤正常站点
+            └── HasFailing=false → 显示 "All sites are online" 统一提示
+```
+
+内层循环中的过滤 [monitor.html#L7](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/templates/monitor.html#L7)：
+```html
+{{ if and $.ShowFailingOnly (eq .StatusStyle "ok" ) }} {{ continue }} {{ end }}
+```
+
+**StatusStyle 的计算** [widget-monitor.go#L109-L115](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget-monitor.go#L109-L115)：
+```go
+func statusCodeToStyle(status int, altStatusCodes []int) string {
+    if status == 200 || slices.Contains(altStatusCodes, status) {
+        return "ok"
+    }
+    return "error"
+}
+```
+
+请求报错和超时场景下 `status.Code == 0`，必然返回 `"error"`，会被正确保留在过滤后的列表中。
+
+---
+
+### 10.5 HasFailing 标记的完整判定
+
+位置：[widget-monitor.go#L63-L65](file:///d:/fz/0601/solo-dogfeeding/code/140-glance/internal/glance/widget-monitor.go#L63-L65)
+
+```go
+if !slices.Contains(site.AltStatusCodes, status.Code) && 
+   (status.Code >= 400 || status.Error != nil) {
+    widget.HasFailing = true
+}
+```
+
+判定逻辑为 **AND( 不在白名单 , OR(Code>=400, 有错误) )**：
+
+| 场景 | Code | Code 在白名单 | Error | HasFailing |
+|------|------|--------------|-------|------------|
+| 正常 200 | 200 | 否 | nil | **false** |
+| HTTP 401 + 白名单=[401] | 401 | **是** | nil | **false** |
+| HTTP 404 | 404 | 否 | nil | **true** |
+| HTTP 502 + 白名单=[502] | 502 | **是** | nil | **false** |
+| 超时 | 0 | 否 | !nil | **true** |
+| DNS 失败 | 0 | 否 | !nil | **true** |
+| HTTP 0（不可能，仅理论） | 0 | 否 | nil | false |
+
+注意第二行和第五行的对比：HTTP 401 只要在白名单中就不算异常，哪怕业务上可能表示鉴权失效。设计上假设用户在配置白名单时已理解该状态码的含义。
+
+---
+
+### 10.6 全链路关系总览图
+
+```
+fetchSiteStatusTask() 返回 siteStatus
+         │
+         ├───────────────────────────────────────────────────────┐
+         │                                                       │
+         ▼                                                       ▼
+  status.Error?                                        status.Code 值
+         │                                                       │
+         ├── !nil ──┬── TimedOut?                                │
+         │          ├── true  → "Timed Out" 分支(模板)           │
+         │          └── false → "ERROR" 分支(模板)               │
+         │                                                       │
+         │          ┌────────────────────────────────────────────┘
+         │          │
+         ▼          ▼
+  ErrorURL 切换?  statusCodeToText() / statusCodeToStyle()
+         │          │
+         │          ├── 200 或在白名单 → "OK" + "ok"
+         │          ├── 404 → "Not Found" + "error"
+         │          ├── 403 → "Forbidden" + "error"
+         │          ├── 401 → "Unauthorized" + "error"
+         │          ├── >=500 → "Server Error" + "error"
+         │          ├── >=400 → "Client Error" + "error"
+         │          └── 其他 → strconv.Itoa(Code) + "error"
+         │
+         ├── true  (Error!=nil && ErrorURL!="") → URL=ErrorURL
+         └── false (其他所有情况)               → URL=DefaultURL
+
+         │                                    │
+         ▼                                    ▼
+  canContinueUpdateAfterHandlingErr()    HasFailing 判定
+         │                                    │
+         ├── fetchStatusForSites err 恒为 nil  ├── 白名单外 AND (Code>=400 OR Error!=nil)
+         └── scheduleNextUpdate() → 5 分钟     └── 任一站点命中即 HasFailing=true
+
