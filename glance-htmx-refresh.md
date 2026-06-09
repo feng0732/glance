@@ -258,9 +258,9 @@ func (a *application) handlePageContentRequest(w http.ResponseWriter, r *http.Re
 
 第 1 部分和第 2 部分内部各自嵌套循环调用 `.Render()`，第 3 部分是列 → widget 的双层循环。
 
-### 2.4 移动端页头返回边界处理
+### 2.4 移动端页头返回边界处理（经代码验证的完整细节）
 
-移动端页头是 `page-content.html` 中条件渲染的第一块内容，其显示-隐藏受三重边界控制：
+移动端页头是 `page-content.html` 中条件渲染的第一块内容，其显示-隐藏、样式、动画受多层边界控制：
 
 **第一边界：服务端模板条件渲染**
 
@@ -274,7 +274,7 @@ func (a *application) handlePageContentRequest(w http.ResponseWriter, r *http.Re
 
 配置项来源：[config.go L82](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/config.go#L82) — `ShowMobileHeader bool`
 
-**第二边界：CSS 媒体查询边界**
+**第二边界：CSS 媒体查询边界 + 完整样式**
 
 [site.css L296-L298](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/site.css#L296-L298) — 桌面端默认隐藏：
 
@@ -284,36 +284,48 @@ func (a *application) handlePageContentRequest(w http.ResponseWriter, r *http.Re
 }
 ```
 
-[mobile.css L218-L225](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/mobile.css#L218-L225) — `@media (max-width: 550px)` 下启用：
+[mobile.css L218-L225](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/mobile.css#L218-L225) — `@media (max-width: 550px)` 下启用，完整样式如下：
 
 ```css
 @media (max-width: 550px) {
     .mobile-reachability-header {
         display: block;
-        /* ... 10vh 垂直内边距，居中显示页面标题 */
+        font-size: 3rem;                           /* 大字号标题 */
+        padding: 10vh 1rem;                        /* 上下 10% 视口高度，左右 1rem */
+        text-align: center;                        /* 水平居中 */
+        color: var(--color-text-highlight);         /* 主题高亮色 */
         animation: pageColumnsEntrance .3s cubic-bezier(0.25, 1, 0.5, 1) backwards;
     }
 }
 ```
 
-**第三边界：content-ready 激活边界**
+**关键发现：动画 `pageColumnsEntrance` 未定义**
 
-虽然模板渲染了 DOM 内，但其父容器 `#page-content` 默认 `display: none`（见 [site.css L10-L12](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/site.css#L10-L12)），只有当 `#page` 加上 `.content-ready` 类后才显示：
+经全量 CSS 文件 grep 验证，代码库中**不存在 `@keyframes pageColumnsEntrance` 定义**。已定义的是：
+- `@keyframes pageContentEntrance` — [site.css L150-L155](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/site.css#L150-L155)，用于 `.page-content` 父容器，效果为 `opacity: 0 → 1`、`translateY(10px) → 0`
+- `@keyframes columnEntrance` — 在 [mobile.css L24](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/mobile.css#L24) 的 `@media` 内定义
+
+因此 `.mobile-reachability-header` 引用的动画名为 `pageColumnsEntrance` 实际无效，该元素的入场动画完全依赖父容器 `.page-content` 的 `pageContentEntrance` 动画。
+
+**第三边界：content-ready 激活边界（含动画时序）**
+
+虽然模板已将 DOM 写入 HTML，但其父容器 `#page-content` 默认 `display: none`（见 [site.css L10-L12](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/site.css#L10-L12)），只有当 `#page` 加上 `.content-ready` 类后才显示并触发入场动画：
 
 ```css
 .page.content-ready > .page-content {
     display: block;
+    animation: pageContentEntrance .3s cubic-bezier(0.25, 1, 0.5, 1) backwards;
 }
 ```
 
-因此移动端页头的完整显示链路是：**配置开启 → 视口宽度 ≤ 550px → 增量内容请求成功 → `content-ready` 类被添加。
+因此移动端页头的完整显示链路是：**配置开启 → 视口宽度 ≤ 550px → finally 块执行（HTTP 成功/错误均会执行）→ `content-ready` 类被添加 → 父容器 `pageContentEntrance` 动画生效**。
 
-**补充：移动端底部导航栏的返回占位
+**补充：移动端底部导航栏的返回占位**
 
-为避免内容被底部导航栏遮挡，`page.html L118 渲染了 `.mobile-navigation-offset` 占位元素，高度与导航栏高度精确匹配：
+为避免内容被底部导航栏遮挡，[page.html L118](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/templates/page.html#L118) 渲染了 `.mobile-navigation-offset` 占位元素，高度与导航栏高度精确匹配：
 
-- 普通移动端：[mobile.css L31-L34](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/mobile.css#L31-L34) — `height: var(--mobile-navigation-height)
-- 全屏模式（PWA）：[mobile.css L184-L186](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/mobile.css#L184-L186) — 额外加上 `--safe-area-inset-bottom
+- 普通移动端：[mobile.css L31-L34](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/mobile.css#L31-L34) — `height: var(--mobile-navigation-height)`
+- 全屏模式（PWA）：[mobile.css L184-L186](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/mobile.css#L184-L186) — 额外加上 `--safe-area-inset-bottom`
 
 ---
 
@@ -515,26 +527,53 @@ func (a *application) StaticAssetPath(asset string) string {
 
 最终 URL 形如：`/static/abc123def456/js/page.js`，内容变化时哈希变化，天然避免缓存污染。
 
-### 4.2 动态内容：无缓存头 → 每次请求必达服务端
+### 4.2 动态内容：无缓存头的请求穿透分析（两层结论）
 
-**增量刷新核心路由** `handlePageContentRequest` 和 **完整页面路由** `handlePageRequest` 均**未设置任何 HTTP 缓存相关响应头**，具体缺失清单：
+**增量刷新核心路由** `handlePageContentRequest` 和 **完整页面路由** `handlePageRequest` 均**未设置任何 HTTP 缓存相关响应头**。以下将结论分为「代码可直接验证的事实」和「基于浏览器行为的推断」两层。
 
-| 响应头 | 状态 | 影响 |
-|--------|------|------|
-| `Cache-Control` | ❌ 未设置 | 浏览器无法获知缓存策略 |
-| `Expires` | ❌ 未设置 | 无明确过期时间 |
-| `ETag` | ❌ 未设置 | 无法做 `If-None-Match` 条件请求 |
-| `Last-Modified` | ❌ 未设置 | 无法做 `If-Modified-Since` 条件请求 |
-| `Pragma` | ❌ 未设置 | 无 HTTP/1.0 兼容缓存指令 |
+---
 
-**请求必达服务端的多层依据**：
+#### 第一层：代码中可直接验证的事实
 
-1. **响应侧缺失**：Go `http.ResponseWriter` 默认不写任何缓存头，`w.Write()` 输出的响应只有 `Date`、`Content-Type`、`Content-Length` 等基础头
-2. **请求侧 fetch 默认行为**：`fetch()` API 的 `cache` 参数默认为 `'default'`，对于没有缓存头的响应，浏览器不会存入 HTTP 缓存（RFC 7234 规定无缓存指令的响应可做启发式缓存，但现代浏览器对 `/api/` 路径的 GET 请求通常采取保守策略即不缓存）
-3. **页面生命周期强制刷新**：每次用户刷新页面或导航到新页面 → 重新加载 `page.js` → 重新执行 `setupPage()` → 必然发起新的 `fetchPageContent()` 调用
-4. **无缓存键爆破机制**：与静态资源不同，动态 API URL 中没有版本哈希或时间戳参数，但由于上述三点，实际上每次请求都穿透到服务端
+| 事实 | 验证依据 |
+|------|----------|
+| 服务端未写入任何缓存相关响应头 | [glance.go L334-L367](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/glance.go#L334-L367) `handlePageContentRequest`、[glance.go L306-L332](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/glance.go#L306-L332) `handlePageRequest` 均无 `w.Header().Set("Cache-Control", ...)` 等调用 |
+| Go `http.ResponseWriter` 默认只输出基础头 | `w.Write()` 默认写入的响应头为 `Date`、`Content-Type`、`Content-Length`，不含任何缓存指令（标准库行为） |
+| 缓存相关头全部缺失的完整清单 |  |
 
-这意味着每次页面加载或刷新，`/api/pages/{page}/content/` 请求必然到达服务端，触发 `page.updateOutdatedWidgets()` 检查并按需更新 widget 数据。
+| 响应头 | 状态 | 代码依据 |
+|--------|------|----------|
+| `Cache-Control` | ❌ 未设置 | handler 中无对应 `Header().Set()` 调用 |
+| `Expires` | ❌ 未设置 | handler 中无对应 `Header().Set()` 调用 |
+| `ETag` | ❌ 未设置 | handler 中无对应 `Header().Set()` 调用 |
+| `Last-Modified` | ❌ 未设置 | handler 中无对应 `Header().Set()` 调用 |
+| `Pragma` | ❌ 未设置 | handler 中无对应 `Header().Set()` 调用 |
+
+| 事实 | 验证依据 |
+|------|----------|
+| `fetch()` 调用未指定 `cache` 参数 | [page.js L9](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/js/page.js#L9) 使用默认值，等效于 `cache: 'default'` |
+| 每次页面加载必然执行 `setupPage()` | `page.js` 末尾直接调用 `setupPage()`，无条件判断 |
+| 动态 API URL 无版本哈希或时间戳参数 | URL 格式为 `/api/pages/{slug}/content/`，仅包含 slug，无缓存爆破参数 |
+| 前端未实现请求级缓存（如 localStorage 缓存响应） | `fetchPageContent` 函数无任何缓存读写逻辑 |
+
+---
+
+#### 第二层：基于浏览器缓存行为的推断（非代码可直接验证）
+
+基于上述代码事实，结合 HTTP 规范（RFC 7234）和主流浏览器（Chrome、Firefox、Safari）的实际行为，可做出以下谨慎推断：
+
+1. **RFC 7234 启发式缓存规则**：规范允许浏览器对无缓存指令的响应进行启发式缓存（通常取 `Date - Last-Modified` 的 10%），但由于响应中**同时缺失 `Last-Modified` 和 `ETag`**，浏览器缺少计算启发式缓存寿命的锚点，大多数实现选择不缓存此类响应。
+
+2. **现代浏览器对 `/api/` 路径的保守策略**：Chrome、Firefox 等主流浏览器对路径中包含 `/api/` 的 GET 请求普遍采取更保守的缓存策略，即使服务端未明确发出 `Cache-Control: no-store`，也倾向于不写入持久化缓存。
+
+3. **页面生命周期强制重新执行**：每次用户刷新页面（F5、Ctrl+R）或通过浏览器导航重新进入页面时，`page.js` 会被重新加载执行，`setupPage()` 随之被调用，`fetchPageContent()` 必然发起一次新请求。
+
+**谨慎结论（非绝对保证）**：在主流浏览器的默认配置下，`/api/pages/{page}/content/` 请求**大概率会穿透到服务端**，但无法排除以下例外场景：
+- 用户使用了非标准浏览器或自定义缓存策略的浏览器扩展
+- 企业代理/网关层对响应添加了缓存头
+- 浏览器实现对 RFC 7234 启发式缓存有特殊处理
+
+如果业务场景需要绝对保证每次穿透，应在 handler 中显式添加 `w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")`。
 
 ### 4.3 Widget 级内存缓存（服务端内缓存，非 HTTP 缓存）
 
@@ -705,11 +744,11 @@ document.documentElement.setAttribute("data-scheme", response.headers.get("X-Sch
 | **未登录分支差异** | [auth.go:handleUnauthorizedResponse()](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/auth.go#L289-L303) | 整页请求 → 303 重定向登录页；内容请求 → 401 JSON（前端将 JSON 渲染为纯文本，loading 正常消失） |
 | **数据刷新与锁边界** | [glance.go:handlePageContentRequest()](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/glance.go#L334-L367) IIFE | page 级 `sync.Mutex` 保护 `updateOutdatedWidgets` + 模板执行；`w.Write()` 在锁外；401/404 分支不加锁直接返回 |
 | **内容片段三部分组成** | [page-content.html](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/templates/page-content.html) | ①移动端页头（条件）②head-widgets（条件）③page-columns（始终渲染） |
-| **移动端页头三重边界** | 配置 `ShowMobileHeader` + [mobile.css @media ≤550px](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/mobile.css#L218-L225) + `.content-ready` 类 | 配置开启 + 窄视口 + finally 执行（HTTP 成功/错误都会执行） 三者同时满足才显示 |
+| **移动端页头多层边界** | 配置 `ShowMobileHeader` + [mobile.css @media ≤550px](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/mobile.css#L218-L225) + `.content-ready` 类 | 配置开启 + 窄视口 + finally 执行（HTTP 成功/错误均执行）才显示；引用的 `pageColumnsEntrance` 动画未定义，实际依赖父容器 `pageContentEntrance` |
 | **DOM 替换边界** | [page.js L753](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/js/page.js#L753) | `innerHTML` 是 L1 替换，之后必须重新绑定所有交互 |
 | **HTTP 错误 vs 网络错误分界** | fetch API 规范 + [page.js L6-L13](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/js/page.js#L6-L13) | HTTP 4xx/5xx → fetch resolve，finally 执行，loading 消失；网络错误 → fetch reject，finally 不执行，loading 永远停留 |
 | **loading 精确位置** | [site.css L157-L169](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/css/site.css#L157-L169) | flex 居中基础上再 `translateY(-250%)`，视觉上偏上 2.5 倍自身高度 |
 | **Widget 激活边界** | [calendar.js L32](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/js/calendar.js#L32) / [todo.js L9](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/static/js/todo.js#L9) | `swapWith` 将服务端骨架替换为客户端完整组件 |
-| **动态请求必达服务端依据** | Go `http.ResponseWriter` 默认行为 + fetch 默认 `cache:'default'` | 无 Cache-Control/ETag/Expires/Last-Modified/Pragma 任何缓存头，每次穿透 |
+| **动态请求穿透分析（两层结论）** | [见 4.2 节](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/glance-htmx-refresh.md#L530-L576) | 代码事实层：无任何缓存头、fetch 用默认 cache；浏览器推断层：主流浏览器下大概率穿透，但非绝对保证 |
 | **HTTP 缓存边界** | 静态资源 vs 动态 API | 静态 24h + 内容哈希爆破；动态 API 无任何缓存头 |
 | **服务端缓存边界** | [widget.go:requiresUpdate()](file:///d:/fz/0601/solo-dogfeeding/code/144-glance/internal/glance/widget.go#L173-L183) | Widget 粒度内存缓存，按 cacheType 判定是否需要拉取新数据 |
