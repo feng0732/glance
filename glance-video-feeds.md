@@ -980,11 +980,159 @@ if err != nil {
 4. **P2 可以做**：`page.mu` 临界区缩小，`wg.Wait()` 完成后就解锁，模板渲染可以拿读锁或无锁执行（widget 数据已写入完毕）
 5. **P2 可以做**：widget 错误汇总成 HTTP 响应头（如 `X-Glance-Widget-Errors: 2`），前端据此判断是否要提示用户
 
+### 8.6 整页 HTML 替换后前端 setup 重新绑定：14 个函数的完整成本
+
+每次刷新如果走"整页 HTML 替换 + 全量 setup 重新绑定"，并不是简单的 DOM 更新，而是一次完整的前端初始化。所有 setup 函数都会重新执行一遍，而且没有任何 teardown/cleanup，高频轮询会导致严重的资源泄漏。
+
+#### 8.6.1 setupPage 的完整执行序列
+
+[setupPage()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/static/js/page.js#L746-L784) 在每次 `innerHTML = pageContent` 之后顺序执行 14 个 setup 函数：
+
+```js
+pageContentElement.innerHTML = pageContent;  // 整页 DOM 被摧毁重建
+try {
+    setupPopovers();
+    setupClocks()
+    await setupCalendars();   // 动态 import calendar.js
+    await setupTodos();       // 动态 import todo.js
+    setupCarousels();
+    setupSearchBoxes();
+    setupCollapsibleLists();
+    setupCollapsibleGrids();
+    setupGroups();
+    setupMasonries();
+    setupDynamicRelativeTime();
+    setupLazyImages();
+} finally {
+    // contentReadyCallbacks 全局数组里的回调全部执行
+    setTimeout(() => setupTruncatedElementTitles(), 50);
+}
+```
+
+14 个 setup 函数的开销与副作用详细拆解：
+
+| # | 函数 | 每次执行的工作 | 副作用来源 | 高频轮询后果 |
+|---|------|-------------|---------|------------|
+| 1 | `setupPopovers()` | 每个 `[data-popover-type]` 元素加 mouseenter/click/mouseleave 监听器 | 元素上的监听器随 DOM 重建会被 GC，但 popover 模块的全局 `containerElement` `mouseenter/mouseleave/keydown/scroll/resize/ResizeObserver 会重新注册吗？看代码：popover.js 顶层就注册了一次 `containerElement.addEventListener("mouseenter"...)`、`ResizeObserver`，这两个是模块加载时注册的，只注册一次。但 `setupPopovers()` 本身每个 target 的监听器是每次都绑 | 元素监听器不会泄漏（被替换的 DOM 元素 GC 会带走） |
+| 2 | `setupClocks()` | 每个时钟元素创建 DOM、启动 `setTimeout` 递归推进、加 `window.resize` 监听器 | `window.addEventListener("resize"...)` 每次都加，无 remove | ⚠ **window resize 监听器累积**：每次刷新多一个 listener。每个时钟的 setTimeout 递归 ticker 在旧 DOM 元素上仍然跑 |
+| 3 | `setupCalendars()` | 动态 `import('./calendar.js')（浏览器缓存只第一次下载），每个 `.calendar` 元素重建 DOM、创建 `advanceTimeTicker = setTimeout(...)` 跨天推进 | `setTimeout` ticker 无清理（`suspend()` 方法存在但从未被调用 | ⚠ **每个日历都有永不停止的 setTimeout**：旧日历元素已经被 innerHTML 替换，但回调仍在跑，还在更新不存在的 DOM |
+| 4 | `setupTodos()` | 动态 `import('./todo.js')，每个 `.todo` 元素上建拖拽、自动缩放 textarea、键盘快捷键 | 多个 `verticallyReorderable` 内部的 mousedown/mousemove/mouseup 监听器 | 被替换 DOM 上的监听器被 GC，但全局 document 上可能有累积（看 `autoScalingTextarea` 的 input 监听器绑元素，mousedown 绑元素 |
+| 5 | `setupCarousels()` | 每个 `.carousel-container` 加 scroll 和 `window.addEventListener("resize"...)` 监听器 | `window.resize` 每个 carousel 加一个，永不 remove | ⚠ **window resize 监听器累积**：10 个 carousel × N 次刷新 = 10×N 个 resize 回调 |
+| 6 | `setupSearchBoxes()` | 全局 `document.addEventListener("keydown")` 处理 S 键聚焦搜索框、每个搜索框 focus/blur 时注册/注销 document keydown/input | **全局 document 监听器每次都加，永不 remove | ⚠ **全局 keydown 监听器累积**：刷新 N 次按 S 键触发 N 次 focus |
+| 7 | `setupCollapsibleLists()` | 每个 `.list.collapsible-container` 动态创建 Show more 按钮、加 click 监听器 | 按钮是新 DOM 上的元素监听器 | 元素 GC 带走，无全局泄漏 |
+| 8 | `setupCollapsibleGrids()` | 每个 grid 一个 `ResizeObserver.observe(gridElement)`，存 `contentReadyCallbacks.push(callback)` 全局数组 | ResizeObserver 无 `disconnect()`，旧 observer 还在观察被替换的 DOM；`contentReadyCallbacks` 数组只 push 不清理 | ⚠ **ResizeObserver 泄漏** + **全局回调数组无限增长** |
+| 9 | `setupGroups()` | 每个 tab 标题加 mousedown/click | 元素上的监听器 | 元素 GC 带走 |
+| 10 | `setupMasonries()` | 每个 `.masonry` 容器一个 `ResizeObserver` | ResizeObserver 无 disconnect | ⚠ **ResizeObserver 泄漏**，旧 masonry 容器的 observer 还在跑 |
+| 11 | `setupDynamicRelativeTime()` | 创建 `setInterval(updateElementsAndTimestamp, 60s)`，加 `document.addEventListener("visibilitychange"...)` | setInterval 永远不 clearInterval；visibilitychange 每次加不 remove | ⚠ **严重泄漏**：刷新 N 次就有 N 个 60 秒定时器同时跑，N 个 visibilitychange 监听器 |
+| 12 | `setupLazyImages()` | 每个 `img[loading=lazy]` 加 load 监听器，push 到 `contentReadyCallbacks` | load 监听器元素 GC 带走；但 `contentReadyCallbacks` 只 push 不清理 | ⚠ **全局回调数组无限增长** |
+| 13 | `setupTruncatedElementTitles()` | 遍历所有截断文字元素设 title 属性 | 纯 DOM 读写字段 | 无泄漏 |
+| 14 | `contentReadyCallbacks.forEach` | 全部注册的回调 | 数组内 `ResizeObserver.observe()` 等 | 每次刷新都在旧的 callbacks 数组里的旧 observer 重新 observe 新 DOM？不，是新 setup* 的 callback 在 push 新的 observer |
+
+#### 8.6.2 没有 teardown/cleanup 机制的关键证据
+
+代码里没有任何"刷新前清理旧资源的逻辑。唯一存在的清理代码都是"局部使用时清理"：
+
+- `hidePopover()` 在 popover 关闭时 removeEventListener + unobserve，但这是用户交互时的清理，**不是**刷新前的清理
+- `calendar.js` 返回了 `suspend: () => clearTimeout(advanceTimeTicker)`，但 `setupCalendars()` 没有保存返回值，`suspend` 从未被调用
+- 所有 14 个 setup 函数都不是幂等的：它们从不检查"这个元素是否已经被初始化过"，每次都无条件地 addEventListener / new ResizeObserver / setInterval
+
+`contentReadyCallbacks 数组（[page.js L495-L499](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/static/js/page.js#L495-L499)）是最简单的泄漏证据：
+
+```js
+const contentReadyCallbacks = [];
+function afterContentReady(callback) {
+    contentReadyCallbacks.push(callback);   // 只 push，从不 splice / 清空
+}
+```
+
+每次 `setupCollapsibleGrids()` 和 `setupLazyImages()` 都会 `afterContentReady(...)` 往里 push，轮询 N 次数组长度线性增长。
+
+#### 8.6.3 高频轮询的综合后果：每分钟刷一次，1 小时后：
+
+- 60 个 `setInterval`（`setupDynamicRelativeTime`）同时跑，每个都遍历 DOM 查询所有 `[data-dynamic-relative-time]` 元素做同样的事
+- 60 个 `document.visibilitychange` 监听器
+- 60 × M 个 `window.resize` 监听器（M 个 carousel + clocks）
+- 数十个 ResizeObserver 观察已经不存在的 DOM（collapsible grids、masonries），每次 resize 都触发
+- K 个日历 setTimeout 递归 ticker 在更新不存在的元素
+- 每次刷新的 `document.keydown` S 键触发多次 focus
+- `contentReadyCallbacks` 数组有上百个回调，每次 `finally` 全部执行一遍
+- 旧 DOM 的所有事件监听器虽然大多会被 GC，但 GC 本身也有成本，尤其频繁创建销毁大量 DOM 节点
+
+这就是为什么"简单加个 setInterval 轮询"在架构上完全不可行——不是后端撑不住，是前端自己先崩。
+
+### 8.7 Server 端未配置 ReadTimeout / WriteTimeout 的影响
+
+代码库中两处创建 `http.Server`，均未配置任何超时参数：
+
+生产服务器 [glance.go L491-L494](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/glance.go#L491-L494)：
+
+```go
+server := http.Server{
+    Addr:    fmt.Sprintf("%s:%d", a.Config.Server.Host, a.Config.Server.Port),
+    Handler: mux,
+}
+```
+
+v0.7 迁移提示服务器 [main.go L212-L216](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/main.go#L212-L216)：
+
+```go
+server := http.Server{
+    Addr:    ":8080",
+    Handler: mux,
+}
+```
+
+Go `net/http` 中四个超时字段全部为 0 时代表"无限制"：
+
+| 字段 | 默认 0 值含义 | 未配置后果 |
+|------|-----------|----------|
+| `ReadTimeout` | 无超时 | 慢速客户端可以保持连接发送请求头直到 TCP keepalive 数小时不释放，占用 file descriptor |
+| `ReadHeaderTimeout` | 沿用 ReadTimeout | 同上，针对请求头阶段 | 慢速发送 header 极慢 |
+| `WriteTimeout` | 无超时 | handler 可以无限长时间不写响应 |
+| `IdleTimeout` | 沿用 ReadTimeout | Keep-Alive 连接永不关闭 |
+
+四个字段全为 0 的具体影响：
+
+1. **慢速 handler + page.mu 永久持有**：如果 `updateOutdatedWidgets()` 里某个 widget HTTP 请求卡住（`context.Background()` 无超时），handler 永远不返回，`page.mu` 锁永久不释放。由于 `WriteTimeout=0`，这个 TCP 连接不会被服务端切断，所有后续同页面请求全部排队堆积，file descriptor 耗尽。
+
+2. **连接堆积雪崩**：前端轮询间隔短（比如 30 秒），而某次刷新因为锁被慢 widget 卡住，下一轮、再下一轮请求一个接一个排队。每个请求都占着一个 goroutine 和一个 TCP 连接，拿不到锁就一直等。没有 `WriteTimeout` 从外部切断。
+
+3. **Keep-Alive 空闲连接不回收**：因为 `IdleTimeout` 为 0，大量 TCP 连接空闲不关闭，file descriptor 数量持续增长。
+
+4. **慢客户端攻击面**：配合 page.mu 的全局锁机制，只要一个慢请求就能卡住整页服务。对单用户家用面板问题不大，但一旦接入直播高频轮询，慢请求 + 无 WriteTimeout + page.mu 三者叠加就会出现服务雪崩。
+
+### 8.8 前后端限制对直播刷新可靠性的联合影响矩阵
+
+前端（14 个 setup 重新绑定 + 无 teardown cleanup + fetch 无超时/状态码检查/重试 + setInterval/ResizeObserver 泄漏）和后端（page.mu 全局锁 + wg.Wait() 木桶效应 + context.Background() 无超时 + http.Server 无 Read/WriteTimeout + 无单 widget 刷新接口）联合起来，对直播状态刷新形成了层层限制：
+
+| 直播场景 | 前端限制 | 后端限制 | 联合后果 |
+|---------|---------|---------|---------|
+| **主播刚开播，用户正在看页面** | 页面无轮询，用户看不到 LIVE 徽章，必须手动 F5 | 即使加了轮询，page.mu + wg.Wait 木桶效应导致延迟不可控 | 直播状态延迟完全不可控，可能 1 分钟也可能 10 分钟以上 |
+| **主播下播** | 同上，徽章不消失 | 同上 | LIVE 徽章残留，用户点击进去发现直播已结束 |
+| **直播 API 超时（5 秒）** | fetch 无 AbortController，前端一直等待 | handler 持锁 5 秒，其他所有请求排队 | 全部用户等待，直播状态停滞 |
+| **直播 API 限流（429）** | 无状态码检查 + 无重试，刷新后静默失败 | widget 错误只变图标，HTTP 仍返回 200 | 用户看不到任何错误提示，只看到直播状态停留在旧数据 |
+| **多用户同时访问轮询** | 每个用户都发起轮询请求 | page.mu 排队，延迟线性叠加 | 用户越多延迟越高，分钟级延迟常态化 |
+| **页面挂一晚上** | setInterval / ResizeObserver / 全局监听器无限累积 | file descriptor 因 IdleTimeout=0 不回收 | 前端内存暴涨页面卡死，后端连接不释放 |
+| **慢 widget 卡住** | 前端 fetch 无超时，页面无限 loading | page.mu 锁永久持有（context.Background 无取消 + WriteTimeout=0） | 整页服务雪崩，所有请求永久排队 |
+
+实际影响估算（假设轮询间隔 1 分钟，开 8 小时）：
+
+- 前端：480 个 `setInterval`（`setupDynamicRelativeTime`）同时跑，每个遍历 DOM 查询所有 `[data-dynamic-relative-time]` 元素；480 个 `document.visibilitychange` 监听器；数百个 `window.resize` 监听器和 ResizeObserver；`contentReadyCallbacks` 数组有上千个回调。浏览器内存持续增长，最终页面卡死。
+- 后端：如果某个 widget 卡住一次，page.mu 永久不释放，后续 480 个请求全部排队，每个占一个 goroutine 和 TCP 连接，没有 WriteTimeout 切断。
+
+结论：**直播状态刷新的瓶颈不在"直播 API 能不能调"，而在整条刷新链路从前端到后端都没有为"高频重复刷新"做过设计。** 简单加个 `setInterval` 轮询会同时触发前端资源泄漏和后端锁堆积的双重问题。
+
 ---
 
 ## 九、调用链总览
 
 ```
+服务器启动 (main.go / glance.go)
+    ↓ http.Server{ Addr, Handler } 创建
+        │  ⚠ 未配置 ReadTimeout / WriteTimeout / IdleTimeout / ReadHeaderTimeout
+        │  ⚠ 全部为 0 = 无限制，慢速请求可永久持有连接和 page.mu 锁
+    ↓ server.ListenAndServe()
+    ↓
 配置加载 (config.go)
     ↓ newWidget("videos") → videosWidget{}
     ↓ initialize()
@@ -1026,9 +1174,23 @@ if err != nil {
             ↓ page.mu.Unlock()  ← 🔓 释放锁
             ↓ 返回 HTTP 响应（只有模板失败才 500，其余一律 200）
     ↓ response.text()  ← ⚠ 500 错误文本也会被当 HTML 塞进页面
-    ↓ pageContentElement.innerHTML = content
-    ↓ setupPopovers / setupCarousels / setupDynamicRelativeTime 等
-        ⚠ setupDynamicRelativeTime 每分钟只刷新相对时间文字，不重新拉内容
+    ↓ pageContentElement.innerHTML = content  ← 整页 DOM 被摧毁重建
+    ↓ setupPage() 内 14 个 setup 函数重新执行：
+        ├─ setupPopovers()        每个 popover target 加 3 个监听器
+        ├─ setupClocks()          每个时钟启动 setTimeout 递归 ticker，加 window.resize
+        ├─ await setupCalendars() 动态 import，每个日历启动 advanceTimeTicker（suspend 从不调用
+        ├─ await setupTodos()     动态 import，建拖拽、自动缩放 textarea
+        ├─ setupCarousels()       每个 carousel 加 scroll + window.resize（⚠ resize 监听器累积）
+        ├─ setupSearchBoxes()     ⚠ 全局 document.keydown 每次都加，永不 remove
+        ├─ setupCollapsibleLists() 每个列表动态创建 Show more 按钮
+        ├─ setupCollapsibleGrids() ⚠ 每个 grid 创建 ResizeObserver，push contentReadyCallbacks
+        ├─ setupGroups()          每个 tab 加 2 个监听器
+        ├─ setupMasonries()       ⚠ 每个 masonry 创建 ResizeObserver，不 disconnect
+        ├─ setupDynamicRelativeTime() ⚠ 严重泄漏：每次一个 setInterval + visibilitychange，永不清理
+        ├─ setupLazyImages()      ⚠ push contentReadyCallbacks，数组只增不减
+        └─ setupTruncatedElementTitles() 纯 DOM 读写
+        ⚠ 所有 setup 无 teardown / cleanup / 幂等检查，高频轮询导致 setInterval/ResizeObserver/全局监听器无限累积
+    ↓ contentReadyCallbacks.forEach 全部执行（数组只 push 不清理）
     ↓ 页面进入 content-ready 状态，此后无自动内容刷新
         ↓ Render()
             ├─ style=="grid-cards" → videos-grid.html → 复用 video-card-contents.html
@@ -1041,7 +1203,8 @@ if err != nil {
 
 - [widget-videos.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-videos.go) — 视频源聚合主逻辑
 - [widget.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget.go) — widget 基类（ContentAvailable 单向锁、Error/Notice 状态机、指数退避重试）
-- [glance.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/glance.go) — 请求驱动刷新链路（handlePageContentRequest → page.mu 锁 → updateOutdatedWidgets → wg.Wait）
+- [glance.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/glance.go) — 请求驱动刷新链路（handlePageContentRequest → page.mu 锁 → updateOutdatedWidgets → wg.Wait），生产 http.Server 创建处（未配置 ReadTimeout/WriteTimeout）
+- [main.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/main.go#L212-L216) — v0.7 迁移提示 http.Server 创建处（同样未配置任何超时）
 - [config.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/config.go#L77-L92) — page 结构体定义（含全局互斥锁 `mu sync.Mutex`）
 - [widget-utils.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-utils.go) — defaultHTTPClient（5s 超时）、并发 worker pool、XML/JSON 解码
 - [widget-twitch-channels.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-twitch-channels.go) — 直播状态参考实现（稳定排序、LIVE UI、10min 缓存）
@@ -1049,4 +1212,7 @@ if err != nil {
 - [video-card-contents.html](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/templates/video-card-contents.html) — 默认/网格样式卡片子模板
 - [videos-vertical-list.html](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/templates/videos-vertical-list.html) — 纵向列表独立渲染模板
 - [widget-base.html](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/templates/widget-base.html) — ERROR 面板、major/minor notice 图标条件渲染
-- [page.js](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/static/js/page.js) — fetchPageContent（无超时/状态码检查/重试，标了 TODO）、轮播、折叠、懒加载、相对时间更新（不做内容轮询）
+- [page.js](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/static/js/page.js) — fetchPageContent（无超时/状态码检查/重试，标了 TODO）、14 个 setup 函数（无 teardown/cleanup，高频轮询会导致 setInterval/ResizeObserver/全局监听器无限累积）
+- [popover.js](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/static/js/popover.js) — popover 模块（hidePopover 有局部 cleanup，但 setupPopovers 刷新前不调用）
+- [calendar.js](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/static/js/calendar.js) — 日历组件（提供 suspend() 清理 advanceTimeTicker，但 setupCalendars 不保存返回值，suspend 从未被调用）
+- [masonry.js](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/static/js/masonry.js) — masonry 布局（每个容器一个 ResizeObserver，不 disconnect）
