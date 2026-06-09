@@ -349,12 +349,112 @@ func (w *widgetBase) withTitle(title string) *widgetBase {
 | `config.Branding.FaviconURL` | 默认 favicon.svg |
 | `splitColumnWidget.MaxColumns` | `< 2` 时设为 `2` |
 
-#### 阶段四：主题默认值
+#### 阶段四：主题默认值与预设注入
 
-在 `newApplication` 的主题初始化部分：
-- 自动注入 `default-dark` 和 `default-light` 两个内置预设
-- 用户自定义 Presets 通过 `orderedYAMLMap.Merge()` 合并（用户配置覆盖内置同名主题）
-- `themeProperties.init()` 生成 CSS 和预览 HTML
+这是最复杂的默认值合并阶段，涉及条件判断、多层合并和优先级规则。核心代码在 [glance.go:104-141](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/glance.go#L104-L141)。
+
+##### 4.1 default-dark 何时被纳入可选项
+
+```go
+defaultDarkTheme, ok := config.Theme.Presets.Get("default-dark")
+if ok && !config.Theme.SameAs(defaultDarkTheme) || !config.Theme.SameAs(&themeProperties{}) {
+    themeKeys = append(themeKeys, "default-dark")
+    themeProps = append(themeProps, &themeProperties{})
+}
+```
+
+这行 `if` 条件的逻辑（运算符优先级：`&&` 高于 `||`）：
+
+```
+条件 = (A && B) || C
+  A = 用户在 YAML 中定义了名为 "default-dark" 的预设
+  B = 默认主题（config.Theme）与用户定义的 default-dark 不同
+  C = 默认主题与零值 themeProperties{} 不同（即用户修改了全局默认主题）
+```
+
+**三种纳入场景**：
+
+| 场景 | A | B | C | 条件值 | 说明 |
+|------|---|---|---|--------|------|
+| 用户没改全局主题，也没自定义 default-dark | false | - | false | false | **不纳入**。此时默认主题就是 default-dark，无需单独列出 |
+| 用户自定义了 default-dark，且与全局默认主题不同 | true | true | - | true | **纳入**。用户覆盖了 default-dark 的样式，需要在选择器中显示 |
+| 用户自定义了 default-dark，但与全局默认主题完全相同 | true | false | - | 取决于 C | 取决于用户是否还改了全局默认主题 |
+| 用户没定义 default-dark，但修改了全局默认主题（如全局 theme.backgroundColor） | - | - | true | true | **纳入**。默认主题已被用户自定义，需要提供"恢复原厂暗色"的选项 |
+
+##### 4.2 default-dark 的实际样式内容
+
+`themeProps = append(themeProps, &themeProperties{})` 传入的是零值结构体。零值 `themeProperties` 所有字段为 nil，这意味着：
+
+- 后端 `theme-style.gotmpl` 模板中所有 `{{ if .BackgroundColor }}` 等条件判断都为 false
+- 最终生成的 CSS 不覆盖任何变量，浏览器直接使用 [main.css:root](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/static/css/main.css#L9-L58) 中硬编码的默认值：
+  ```css
+  --bgh: 240; --bgs: 8%; --bgl: 9%;     /* 背景：hsl(240, 8%, 9%) */
+  --color-primary: hsl(43, 50%, 70%);   /* 主色：金棕色 */
+  --color-negative: hsl(0, 70%, 70%);   /* 错误色：红色 */
+  --cm: 1; --tsm: 1;                   /* 对比度、饱和度乘数 */
+  ```
+
+因此 **default-dark 的实际值 = main.css 中 `:root` 的 CSS 默认值**，而不是在 Go 代码中重新定义的。
+
+##### 4.3 default-light 的无条件纳入
+
+```go
+themeKeys = append(themeKeys, "default-light")
+themeProps = append(themeProps, &themeProperties{
+    Light:                    true,
+    BackgroundColor:          &hslColorField{240, 13, 95},   /* hsl(240, 13%, 95%) 浅灰 */
+    PrimaryColor:             &hslColorField{230, 100, 30},  /* hsl(230, 100%, 30%) 深蓝 */
+    NegativeColor:            &hslColorField{0, 70, 50},     /* hsl(0, 70%, 50%) 深红 */
+    ContrastMultiplier:       1.3,
+    TextSaturationMultiplier: 0.5,
+})
+```
+
+与 default-dark 不同，**default-light 总是被无条件加入**，无论用户是否修改主题。这是因为浅色主题与默认深色主题差异巨大，几乎所有场景下用户都需要切换选项。
+
+##### 4.4 预设合并与优先级
+
+```go
+themePresets, err := newOrderedYAMLMap(themeKeys, themeProps)
+config.Theme.Presets = *themePresets.Merge(&config.Theme.Presets)
+```
+
+合并规则由 [orderedYAMLMap.Merge](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/config.go#L607-L637) 定义：
+- 以 `themePresets`（内置 default-dark + default-light）为基础
+- 遍历用户 `config.Theme.Presets`，用户 key 已存在则覆盖 value，不存在则追加到末尾
+- **最终顺序**：default-dark（若纳入）→ default-light → 用户自定义 presets（按 YAML 中定义顺序）
+
+**优先级**：用户自定义的同名预设覆盖内置预设。例如用户在 YAML 中：
+```yaml
+theme:
+  presets:
+    default-light:
+      background-color: "hsl(0, 0%, 100%)"
+```
+则主题选择器中的 "default-light" 显示纯白背景而非内置的 hsl(240, 13%, 95%)。
+
+##### 4.5 主题 Key 与初始化
+
+```go
+for key, properties := range config.Theme.Presets.Items() {
+    properties.Key = key                    // 将 key 写入结构体，供模板渲染使用
+    if err := properties.init(); err != nil {  // 生成 CSS 片段和预览 HTML
+        return nil, fmt.Errorf("initializing preset theme %s: %v", key, err)
+    }
+}
+
+config.Theme.Key = "default"     // 默认主题的 Key 标记为 "default"
+if err := config.Theme.init(); err != nil {
+    return nil, fmt.Errorf("initializing default theme: %v", err)
+}
+```
+
+`themeProperties.init()` 的作用：
+1. 如果配置了颜色但 `Light` 未明确设置，自动根据背景亮度推断 `Light` 值
+2. 渲染 `theme-style.gotmpl` 生成内联 CSS，存入 `styleCSS` 字段
+3. 渲染 `theme-preset-preview.html` 生成预览按钮 HTML，存入 `previewHTML` 字段
+
+**最终结果**：主题选择器中每个预设按钮的样式、内联 CSS 全部在应用启动时预生成，运行时直接输出。
 
 ### 5.2 容器类 Widget 的子 Widget 默认传递
 

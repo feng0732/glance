@@ -517,6 +517,44 @@ function afterContentReady(callback) {
 
 例如 `setupLazyImages()` 和 `setupCollapsibleGrids()` 都通过 `afterContentReady()` 延迟 ResizeObserver 的 attach，确保能正确读取元素尺寸。
 
+### 7.6 CSS 显示切换机制：从 Loading 到 Content
+
+骨架与内容的可见性完全通过 CSS class 切换控制，无需 JS 手动操作 `display` 属性。核心规则定义在 [site.css:10-17](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/static/css/site.css#L10-L17)：
+
+```css
+/* 初始状态：内容区隐藏，loading 也隐藏（因为 .content-ready 不在祖先链上） */
+.page-content,
+.page.content-ready .page-loading-container {
+    display: none;
+}
+
+/* 就绪状态：内容区显示，同时 loading 容器被上面的规则隐藏 */
+.page.content-ready > .page-content {
+    display: block;
+    animation: pageContentEntrance .3s cubic-bezier(0.25, 1, 0.5, 1) backwards;
+}
+```
+
+**两种状态对比**：
+
+| DOM 状态 | `.page-content` | `.page-loading-container` |
+|---------|-----------------|--------------------------|
+| 初始（无 `.content-ready`） | `display: none`（匹配第1条规则） | 默认 `display: flex`（[site.css:157-165](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/static/css/site.css#L157-L165)），显示 Loading 图标 |
+| 就绪（`.page.content-ready`） | `display: block` + 入场动画（匹配第2条规则） | `display: none`（匹配第1条规则的后半部分） |
+
+**动画延迟启用**：300ms 后才添加 `page-columns-transitioned` class（[page.js:779-781](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/static/js/page.js#L779-L781)），目的是避免首屏 masonry 布局重排触发大量列动画，影响性能感知。
+
+```css
+/* mobile.css:20-22 */
+.page-columns-transitioned .page-column {
+    animation-duration: .3s;
+}
+/* utils.css:260 */
+.page-columns-transitioned .list-with-transition > * {
+    animation: collapsibleItemReveal .25s backwards;
+}
+```
+
 ---
 
 ## 八、Split-Column 的列分配策略详解
@@ -559,11 +597,15 @@ export function setupMasonries() {
         const container = masonryContainers[i];
 
         const options = {
-            minColumnWidth: container.dataset.minColumnWidth || 330,  // 默认 330px
-            maxColumns: container.dataset.maxColumns || 6,            // 默认 6 列
+            minColumnWidth: container.dataset.minColumnWidth || 330,  // 默认 330px，可通过 HTML data-min-column-width 覆盖
+            maxColumns: container.dataset.maxColumns || 6,            // 前端默认 6，但后端 split-column 默认传 2
         };
 
-        const items = Array.from(container.children);  // 缓存所有子元素（引用，不会被 DOM 移除影响）
+        // ── 关键：缓存 DOM 元素引用 ──
+        // Array.from(container.children) 创建的是元素引用数组
+        // 后续 container.textContent = "" 只是将它们从 DOM 树中 detach，引用仍然有效
+        // appendChild 时会自动将元素从旧位置移动到新位置，不会丢失
+        const items = Array.from(container.children);
         let previousColumnsCount = 0;
 
         const render = function() {
@@ -664,8 +706,73 @@ i=6 → 6%3=0 → Col0
    └───┘
 ```
 
-### 8.5 后端 MaxColumns 与前端的协作
+### 8.5 初始化时序与 DOM 就绪条件
+
+`setupMasonries()` 被调用的时机在 [page.js](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/static/js/page.js#L766) 的 `setupPage()` 中：
+
+```
+setupPage() 执行顺序：
+    1. initThemePicker()
+    2. fetchPageContent()           ← 等待 API 返回
+    3. pageContentElement.innerHTML = pageContent  ← 同步写入 DOM
+    4. setupPopovers()
+       setupClocks()
+       await setupCalendars()
+       await setupTodos()
+       setupCarousels()
+       setupSearchBoxes()
+       setupCollapsibleLists()
+       setupCollapsibleGrids()
+       setupGroups()
+       setupMasonries()            ← 此时 masonry 容器及其子元素已在 DOM 中
+       setupDynamicRelativeTime()
+       setupLazyImages()
+    5. pageElement.classList.add("content-ready")  ← 才显示内容
+```
+
+关键点：
+- `setupMasonries()` 执行时，`innerHTML` 已完成写入，masonry 容器和子元素都已在 DOM 树中
+- 但此时 `.page-content` 仍然是 `display: none`，`container.offsetWidth` 读取的是隐藏状态下的宽度（通常为 0 或父容器宽度）
+- 由于 `ResizeObserver` 在 `display: none` 时也会触发（或当元素变为可见时触发），首次 `render()` 可能计算出错误的列数，但随后 `ResizeObserver` 会在 `.content-ready` 添加后再次触发 `render()`，此时 `offsetWidth` 正确，重新分配
+- 列数变化后 `previousColumnsCount` 更新，后续只有列数真正变化才会重建 DOM
+
+### 8.6 clamp 函数与列数边界计算
+
+列数计算使用的 `clamp()` 函数定义在 [utils.js:27-29](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/static/js/utils.js#L27-L29)：
+
+```javascript
+export function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+}
+```
+
+完整列数计算公式展开：
+
+```
+columnsCount = clamp(
+    Math.floor(container.offsetWidth / options.minColumnWidth),
+    1,
+    Math.min(options.maxColumns, items.length)
+)
+```
+
+即：
+```
+columnsCount = Math.min(
+    Math.max(
+        Math.floor(容器宽度 / 最小列宽),
+        1                                 ← 至少 1 列
+    ),
+    Math.min(
+        options.maxColumns,               ← 不超过配置的 max-columns
+        items.length                      ← 不超过子元素个数
+    )
+)
+```
+
+### 8.7 后端 MaxColumns 与前端的协作
 
 - 后端 widget 的 `MaxColumns` 配置通过 `data-max-columns` 属性传递给前端
 - 若用户未配置 `max-columns`，[widget-split-column.go:24-26](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/widget-split-column.go#L24-L26) 将默认值设为 2
 - 前端 `clamp()` 确保实际列数不会超过此值，也不会超过子元素数量
+- `minColumnWidth` 目前模板中未输出对应 data 属性，始终使用前端默认值 330px
