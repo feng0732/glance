@@ -149,7 +149,35 @@ type weatherColumn struct {
 }
 ```
 
-### 4.2 24 小时 → 12 列聚合
+### 4.2 数据完整性检查（不满 24 条留空的原因）
+
+[widget-weather.go#L240-L284](file:///d:/fz/0601/solo-dogfeeding/code/138-glance/internal/glance/widget-weather.go#L240-L284)
+
+在聚合之前，代码先初始化了一个空切片和三个关键列索引：
+
+```go
+now := time.Now().In(place.location)
+bars := make([]weatherColumn, 0, 24)        // 空切片，容量 24
+currentBar := now.Hour() / 2
+sunriseBar := ...
+sunsetBar  := ...
+```
+
+真正的聚合逻辑被包裹在一层长度守卫中：
+
+```go
+if len(responseJson.Hourly.Temperature) == 24 {
+    // ... 执行 24→12 聚合，向 bars 中 append 12 个 weatherColumn
+}
+```
+
+**留空原因**：当 API 返回的 `Hourly.Temperature` 数组长度不等于 24 时（例如请求接近午夜、API 异常、时区边界问题导致只返回部分时段数据），整个聚合块被跳过，`bars` 切片保持为空（长度 0）。最终 `weather.Columns` 是空切片，模板中 `{{ range $i, $column := .Weather.Columns }}` 不会产生任何迭代输出，预报列区域完全空白，只有天气状况文字和体感温度仍能显示。
+
+该行为是一种**静默降级策略**：不报错、不填充占位数据，直接跳过渲染。
+
+---
+
+### 4.3 24 小时 → 12 列聚合
 
 [widget-weather.go#L250-L284](file:///d:/fz/0601/solo-dogfeeding/code/138-glance/internal/glance/widget-weather.go#L250-L284)
 
@@ -170,11 +198,15 @@ API 返回 24 个整点温度（`Hourly.Temperature`）和 24 个整点降水概
 └──────────────────┴──────────────────────────────────────────────────┘
 ```
 
-### 4.3 温度归一化（Scale 计算）
+### 4.4 温度归一化与柱高映射（Scale → CSS）
 
 [widget-weather.go#L267-L283](file:///d:/fz/0601/solo-dogfeeding/code/138-glance/internal/glance/widget-weather.go#L267-L283)
+[weather.html#L18](file:///d:/fz/0601/solo-dogfeeding/code/138-glance/internal/glance/templates/weather.html#L18)
+[widget-weather.css#L42-L52](file:///d:/fz/0601/solo-dogfeeding/code/138-glance/internal/glance/static/css/widget-weather.css#L42-L52)
 
-为使柱状图在视觉上有高低差异，对 12 个温度做 Min-Max 归一化：
+为使柱状图在视觉上有高低差异，对 12 个温度做 Min-Max 归一化生成 `Scale`，然后经过 Go 模板 → CSS 变量 → calc() 运算，最终映射为像素高度。整个链路分三步：
+
+**第 1 步：Min-Max 归一化生成 Scale（Go 代码）**
 
 ```
 minT = slices.Min(temperatures)
@@ -182,14 +214,44 @@ maxT = slices.Max(temperatures)
 range = maxT - minT
 
 若 range > 0:
-    Scale[i] = (temperatures[i] - minT) / range   ∈ [0, 1]
-若 range = 0（恒温）:
-    Scale[i] = 1  （全部满柱）
+    Scale[i] = (temperatures[i] - minT) / range   ∈ [0.0, 1.0]
+若 range = 0（全天恒温）:
+    Scale[i] = 1.0  （全部满柱）
 ```
 
-该 `Scale` 值通过 CSS 变量 `--weather-bar-height` 控制柱状条高度百分比。
+**第 2 步：模板将 Scale 注入 CSS 变量（HTML 模板）**
 
-### 4.4 关键列索引汇总
+```html
+<div class="weather-bar" style='--weather-bar-height: {{ printf "%.2f" $column.Scale }}'></div>
+```
+
+Go 的 `printf "%.2f"` 将浮点数格式化为保留两位小数的字符串，例如 `0.00`、`0.33`、`1.00`，写入每个柱子的内联样式 `--weather-bar-height`。
+
+**第 3 步：CSS calc() 将比例转换为像素高度（样式表）**
+
+```css
+.weather-bar {
+    height: calc(20px + var(--weather-bar-height) * 40px);
+    width: 6px;
+    mask-image: linear-gradient(0deg, transparent 0, #000 10px);
+}
+```
+
+最终柱高公式：
+
+```
+height = 20px + (Scale × 40px)
+
+Scale = 0.00  →  20px + 0px   = 20px  （最低柱，仅显示底座）
+Scale = 0.50  →  20px + 20px  = 40px  （中等高度）
+Scale = 1.00  →  20px + 40px  = 60px  （最高柱）
+```
+
+柱高变化范围为 **20px ~ 60px**，共 40px 的动态区间。底部 10px 通过 `mask-image` 渐变为透明，使柱子视觉上从底部柔和过渡。当前列或 hover 时，柱宽由 6px 加粗到 10px，颜色也更亮。
+
+---
+
+### 4.5 关键列索引汇总
 
 | 字段            | 含义                                      | 计算方式                              |
 |-----------------|-------------------------------------------|---------------------------------------|
@@ -197,7 +259,7 @@ range = maxT - minT
 | `SunriseColumn` | 日出所在列（日出光线起始柱）              | `sunriseHour / 2`                     |
 | `SunsetColumn`  | 日落所在列（日落光线终止柱，前移 1 小时） | `(sunsetHour - 1) / 2`，下限为 0      |
 
-### 4.5 模板渲染逻辑
+### 4.6 模板渲染逻辑
 
 [weather.html#L8-L22](file:///d:/fz/0601/solo-dogfeeding/code/138-glance/internal/glance/templates/weather.html#L8-L22)
 
@@ -233,7 +295,9 @@ update(ctx)
           ├─ 构造 Forecast API 请求（timezone=place.Timezone）
           ├─ now = time.Now().In(place.location) ← 时区对齐
           ├─ 计算 CurrentColumn / SunriseColumn / SunsetColumn
+          ├─ 长度守卫：len(Hourly.Temperature) == 24？否则跳过聚合
           ├─ 24h → 12 列聚合（温度平均 + 降水阈值判断）
-          ├─ Min-Max 归一化 → Scale
-          └─ 返回 weather{}
+          ├─ Min-Max 归一化 → Scale（Go）
+          ├─ 模板注入 CSS 变量 --weather-bar-height
+          └─ CSS calc() 映射为 20px~60px 柱高
 ```
