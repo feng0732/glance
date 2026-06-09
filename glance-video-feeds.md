@@ -721,6 +721,8 @@ func (channels twitchChannelList) sortByLive() {
 |------|------------|------------------|---------|
 | 刷新频率 | 1 小时，单一值 | 需要双轨：RSS 1h + 直播 API 5~10min | 🔴 框架限制，需改 widgetBase 或绕过 |
 | 刷新触发 | 仅页面请求时 | 前端加周期轮询或后台 ticker | 🔴 架构限制 |
+| 轮询并发性 | N/A（无轮询） | page.mu 全局互斥锁阻止高频并发刷新 | 🔴 架构限制（见 8.2 节） |
+| 接口可靠性 | N/A（很少调用） | fetch 无超时、无状态码检查、无重试 | 🔴 前端完全缺失（见 8.3 节） |
 | video 结构体 | 6 字段 | 加 `IsLive`、`LiveSince`、`LiveViewers`、`StreamTitle`、`Category` | 🟢 简单改动 |
 | 排序 | `sort.Slice` 按时间 | 加 `sort.SliceStable` 直播置顶模式，离线用哨兵值 | 🟡 需改动排序函数 |
 | 错误通道 | 单一 Error/Notice | 需要区分 RSS 错误和直播错误 | 🟡 中等改动 |
@@ -731,7 +733,256 @@ func (channels twitchChannelList) sortByLive() {
 
 ---
 
-## 八、调用链总览
+## 八、整页刷新路径与可靠性分析
+
+直播状态要做到"准实时刷新"，不是简单在前端加个 `setInterval` 就能完事。整条刷新链路在并发控制、超时处理、错误响应等环节都有缺口，会直接影响直播刷新的稳定性和用户体验。
+
+### 8.1 整页刷新的完整路径
+
+刷新不是"某个 widget 自己刷新"，而是**整页所有 widget 一起判断过期、一起更新、一起渲染、一起返回**。完整前后端链路如下：
+
+**前端触发（page.js）**：
+
+[setupPage()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/static/js/page.js#L746-L786) 在页面加载时执行一次：
+
+```js
+async function setupPage() {
+    initThemePicker();
+    const pageElement = document.getElementById("page");
+    const pageContentElement = document.getElementById("page-content");
+    const pageContent = await fetchPageContent(pageData);   // ← 仅此一次
+
+    pageContentElement.innerHTML = pageContent;
+
+    try {
+        setupPopovers();
+        setupClocks();
+        await setupCalendars();
+        // ... 十几个 setup 函数
+        setupDynamicRelativeTime();   // 只更新相对时间文字，不重新拉内容
+        setupLazyImages();
+    } finally {
+        pageElement.classList.add("content-ready");
+        // ...
+    }
+}
+```
+
+[fetchPageContent()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/static/js/page.js#L6-L13) 极简：
+
+```js
+async function fetchPageContent(pageData) {
+    // TODO: handle non 200 status codes/time outs
+    // TODO: add retries
+    const response = await fetch(`${pageData.baseURL}/api/pages/${pageData.slug}/content/`);
+    const content = await response.text();
+    return content;
+}
+```
+
+两个 TODO 是开发者自己埋下的可靠性伏笔，详见 8.3 节。
+
+**后端处理（glance.go）**：
+
+请求进入 [handlePageContentRequest()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/glance.go#L334-L367)：
+
+```go
+func (a *application) handlePageContentRequest(w http.ResponseWriter, r *http.Request) {
+    page, exists := a.slugToPage[r.PathValue("page")]
+    // ... 鉴权
+
+    pageData := templateData{Page: page}
+
+    func() {
+        page.mu.Lock()           // ← 1. 拿整页全局互斥锁
+        defer page.mu.Unlock()
+
+        page.updateOutdatedWidgets()   // ← 2. 同步更新所有过期 widget
+        err = pageContentTemplate.Execute(&responseBytes, pageData)  // ← 3. 渲染整页模板
+    }()
+
+    if err != nil {
+        w.WriteHeader(http.StatusInternalServerError)
+        w.Write([]byte(err.Error()))
+        return
+    }
+    w.Write(responseBytes.Bytes())
+}
+```
+
+[page 结构体](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/config.go#L77-L92) 定义了这个互斥锁：
+
+```go
+type page struct {
+    Title    string
+    Columns  []struct { ... Widgets widgets ... }
+    mu       sync.Mutex `yaml:"-"`   // 每个 page 实例一把锁
+    // ...
+}
+```
+
+[updateOutdatedWidgets()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/glance.go#L233-L270) 并发更新所有过期 widget，但**等全部完成才返回**：
+
+```go
+func (p *page) updateOutdatedWidgets() {
+    now := time.Now()
+    var wg sync.WaitGroup
+    context := context.Background()   // ← 根 context，无超时
+
+    for c := range p.Columns {
+        for w := range p.Columns[c].Widgets {
+            widget := p.Columns[c].Widgets[w]
+            if !widget.requiresUpdate(&now) {
+                continue
+            }
+            wg.Add(1)
+            go func() {
+                defer wg.Done()
+                widget.update(context)
+            }()
+        }
+    }
+    wg.Wait()   // ← 阻塞到所有 goroutine 完成
+}
+```
+
+整条路径的关键特征：**锁 → 所有过期 widget 更新（wg.Wait）→ 整页渲染 → 解锁**，四步在同一个互斥锁临界区内串行完成。
+
+### 8.2 为何高频轮询被硬性限制
+
+如果前端加 `setInterval(fetchPageContent, 60000)`（每分钟刷一次）来追求直播状态新鲜度，会撞到三层瓶颈：
+
+#### 瓶颈一：page.mu 全局互斥锁 —— 串行化所有请求
+
+同一个 page slug 的所有请求都争抢 `page.mu` 同一把锁。场景：
+
+1. 用户 A 在 0 秒请求 → 拿到锁，开始更新 20 个 widget
+2. 用户 B 在 0.5 秒请求 → `Lock()` 阻塞等待
+3. 用户 C 在 1 秒请求 → 同样阻塞排队
+4. 所有并发请求被强制串行化，响应时间 = 排队数 × 单次处理时间
+
+锁在整个 `updateOutdatedWidgets()` + `Execute()` 期间都持有，而不是只在写共享数据时持有。
+
+#### 瓶颈二：wg.Wait() 木桶效应 —— 最慢 widget 决定整页延迟
+
+`updateOutdatedWidgets()` 用 `wg.Wait()` 等所有过期 widget 全部完成，哪怕只有 1 个 widget 还在跑，锁就不会释放。
+
+具体到 Videos widget + 直播 API 的场景：
+- 30 个 YouTube RSS feed，单个请求超时 5 秒（`defaultClientTimeout`），并发 30 worker，最差 5 秒完成
+- 如果直播 API 响应慢（比如 YouTube Data API 偶尔 3~4 秒），就被它拖慢整页
+- 页面上其他慢 widget（天气、日历、DNS 统计等）也都会被等
+
+哪怕你只想刷新直播状态，也必须等整页所有过期 widget 都更新完，**没有"单 widget 刷新"的接口**（`handleWidgetRequest()` 目前还是 501 Not Implemented）。
+
+#### 瓶颈三：context.Background() 无请求级超时 —— 理论上可以永久挂死
+
+`updateOutdatedWidgets()` 传入的是 `context.Background()`，没有任何 deadline。虽然单个 HTTP 请求有 `defaultHTTPClient.Timeout = 5 * time.Second` 保护，但：
+
+- 如果某个 widget 的 `update()` 里做了多次串行 HTTP 请求（比如直播 API 先拿 token 再查状态再拿预览图），总时间可以远超 5 秒
+- 如果 widget 里有 CPU 密集计算或死循环（理论 bug），没有任何机制打断它
+- 锁会被一直持有，后续所有请求全部排队超时
+
+Go `net/http` server 默认有 `ReadTimeout` / `WriteTimeout`，可以从外层切断连接，但 `updateOutdatedWidgets()` 的 goroutine 不会被取消，会一直在后台跑，锁也一直不释放。
+
+三层瓶颈叠加的结论：**前端轮询间隔不能短于"最慢 widget 更新时间 × 并发用户数"**。假设 10 个用户同时访问，每个更新平均 3 秒，轮询间隔至少要 30 秒才不会导致请求堆积。要做 1 分钟级的直播刷新，单用户还行，多用户会直接被锁排队拖垮。
+
+### 8.3 超时与非 200 响应的缺失应对措施
+
+刷新链路在前后端都缺少可靠性保障，而且是开发者明知道的缺口（代码里直接写了 TODO）。
+
+#### 8.3.1 前端 fetchPageContent：三项全缺
+
+[fetchPageContent()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/static/js/page.js#L6-L13) 的两行 TODO 说明了一切：
+
+```js
+// TODO: handle non 200 status codes/time outs
+// TODO: add retries
+const response = await fetch(`${pageData.baseURL}/api/pages/${pageData.slug}/content/`);
+const content = await response.text();
+```
+
+逐项拆解：
+
+**缺 1：无超时（AbortController）**
+
+`fetch()` 默认没有超时限制。如果后端因为锁排队迟迟不响应，浏览器会一直等到 TCP keepalive 超时（通常几分钟），期间页面一直处于 loading 状态。没有 `AbortController` + `signal` 来主动中断。
+
+**缺 2：无状态码检查**
+
+`response.text()` 不管 `response.ok` 与否都会执行。后端返回 500 Internal Server Error 时，响应体是 `err.Error()` 的纯文字：
+
+```go
+if err != nil {
+    w.WriteHeader(http.StatusInternalServerError)
+    w.Write([]byte(err.Error()))   // 比如 "template execution error: ..."
+    return
+}
+```
+
+这段错误文字会被直接塞进 `pageContentElement.innerHTML`，用户看到页面上铺满 Go 错误信息，同时 `setupPopovers()` 等后续 JS 因为 DOM 结构不对而抛异常，`finally` 里的 `content-ready` 类可能加上了，但页面已经处于不可用状态。
+
+401 / 403 鉴权失败也一样，`showUnauthorizedJSON` 返回的是 JSON，被当 HTML 渲染出来就是 `{"error":"unauthorized"}`。
+
+**缺 3：无重试逻辑**
+
+网络波动导致的一次性失败没有重试。`setupPage()` 只在页面加载时调用一次，失败了就永远失败，用户必须手动 F5。
+
+如果加了 `setInterval` 做轮询，一次失败不会自动重试，要等下一个周期，最坏情况下直播状态会停滞 2 个周期以上。
+
+#### 8.3.2 后端 handler：缺少请求级超时和优雅降级
+
+[handlePageContentRequest()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/glance.go#L334-L367) 本身的可靠性也不足：
+
+**缺 1：无 handler 级 timeout**
+
+没有 `context.WithTimeout(r.Context(), 10*time.Second)` 之类的保护。`r.Context()` 是 net/http 给的请求 context，客户端断连会取消它，但如果客户端不主动断（比如浏览器挂着），handler 可以一直跑。
+
+**缺 2：非模板错误一律返回 200**
+
+只有模板执行 `Execute()` 失败才会返回 500。而 widget 内部的失败（RSS 超时、直播 API 403 等）都被 `canContinueUpdateAfterHandlingErr` 吞掉，变成 widget header 上的小图标，HTTP 响应状态码仍然是 `200 OK`。前端无法通过状态码判断"这次刷新是否有效"，只能靠解析 HTML 找错误提示。
+
+**缺 3：无快速失败 / 降级响应**
+
+如果 `page.mu` 已经被持有了 5 秒以上，说明前面的请求很慢，当前请求大概率也会慢。没有 `TryLock()` 之类的机制来快速返回 503 Service Unavailable 或返回缓存的旧内容，而是一律阻塞等待。
+
+#### 8.3.3 单个 HTTP 请求层面：有基本保护但不传播
+
+作为对比，单个 widget 内部的 HTTP 请求是有保护的：
+
+- [defaultHTTPClient](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-utils.go#L24-L32) 有 `Timeout: 5 * time.Second`
+- [decodeJsonFromRequest()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-utils.go#L62-L93) 和 [decodeXmlFromRequest()](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-utils.go#L102-L133) 都会检查 `response.StatusCode != http.StatusOK`，非 200 会返回格式化错误
+- RSS widget 还额外处理了 `304 Not Modified`（[widget-rss.go L222-L224](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-rss.go#L222-L224)）
+
+但这些错误只会在 widget 内部变成 `Error` / `Notice`，不会上升到 HTTP 响应状态码，前端无从感知。
+
+### 8.4 对直播状态刷新的具体影响
+
+| 限制 | 对直播刷新的实际后果 |
+|------|-------------------|
+| page.mu 全局锁 | 多用户同时轮询时请求排队，直播状态延迟从"1 分钟"变成"N 分钟"，N 取决于排队长度 |
+| wg.Wait() 木桶效应 | 直播 API 本身快但其他慢 widget（天气、日历等）也会让锁不释放，拖慢直播刷新 |
+| context.Background() 无超时 | 某个 widget 卡住时，整页直播刷新永久停滞，前端只能等浏览器层超时 |
+| fetch 无 AbortController | 后端慢响应时前端无法中断，发起下一轮轮询会造成"请求堆积"（旧请求还在等，新请求又发了） |
+| 无状态码检查 | 后端 500 时页面渲染错误文本，直播徽章消失，用户以为主播全下播了 |
+| 无重试 | 直播 API 一次偶发 5xx，直播状态要等到下一个轮询周期才恢复，最坏滞后 2 个周期 |
+| 无单 widget 刷新接口 | 哪怕只关心直播状态，每次都要拉整页 HTML，带宽和 CPU 都浪费 |
+| widget 错误不传播到 HTTP 状态码 | 前端无法区分"刷新成功但没人直播"和"刷新失败"，都显示为没有 LIVE 徽章 |
+
+对直播用户体验的连锁影响是：**LIVE 徽章的出现和消失都可能延迟数分钟甚至完全错乱**，而用户又得不到任何"数据可能已过期"的提示——跟 Twitch 直播间那种"直播中断了但页面几秒内就切换到离线画面"的体验完全不在一个量级。
+
+### 8.5 改造优先级建议
+
+如果要做直播功能，按影响面从小到大排序：
+
+1. **P0 必须做**：`fetchPageContent()` 加 `AbortController` 超时 + `response.ok` 检查 + 失败重试（2~3 次指数退避），这三行 TODO 必须先填上
+2. **P0 必须做**：新增 `/api/widgets/{id}` 单 widget 刷新接口（补全 `handleWidgetRequest`），直播状态只刷自己，不拖整页
+3. **P1 应该做**：`handlePageContentRequest` 加 `context.WithTimeout(r.Context(), 10*time.Second)`，把超时从单个 HTTP 请求提升到整个 handler 级别
+4. **P2 可以做**：`page.mu` 临界区缩小，`wg.Wait()` 完成后就解锁，模板渲染可以拿读锁或无锁执行（widget 数据已写入完毕）
+5. **P2 可以做**：widget 错误汇总成 HTTP 响应头（如 `X-Glance-Widget-Errors: 2`），前端据此判断是否要提示用户
+
+---
+
+## 九、调用链总览
 
 ```
 配置加载 (config.go)
@@ -741,44 +992,61 @@ func (channels twitchChannelList) sortByLive() {
         └─ withCacheDuration(time.Hour)   // 应用层缓存 1h
     ↓
 用户浏览器加载页面 (page.js setupPage)
-    ↓ fetchPageContent() 仅调用一次，无周期轮询
+    ↓ fetchPageContent() 仅调用一次
+        │  ⚠ 无 AbortController 超时  ⚠ 无 response.ok 检查  ⚠ 无重试（代码中标 TODO）
     ↓ HTTP GET /api/pages/{slug}/content/
-        ↓ handlePageContentRequest() 拿 page.mu 互斥锁
-            ↓ page.updateOutdatedWidgets()
-                ↓ 遍历所有 widget，调 requiresUpdate(now)
-                    ├─ nextUpdate.IsZero() → 首次必刷
-                    └─ now.After(nextUpdate) → 到期才刷
-                        ↓ widget.update(ctx)  并发 goroutine 执行
-                            ↓ fetchYoutubeChannelUploads(Channels, ...)
-                                ├─ 按前缀/UC 判定 → 构造 playlist_id 或 channel_id URL
-                                ├─ 30 worker 并发 GET YouTube RSS
-                                ├─ XML → youtubeFeedResponseXml
-                                ├─ TimePosted 解析失败→time.Now→置顶
-                                ├─ 跨频道 sortByNewest()
-                                └─ 截断到 Limit 条
-                            ↓ canContinueUpdateAfterHandlingErr(err) 状态机：
-                                ├─ errNoContent
-                                │   ├─ ContentAvailable==false → 全屏 ERROR，下一次 1m/4m/9m... 后
-                                │   └─ ContentAvailable==true  → 旧内容 + 红色 major 图标，保留旧 Videos
-                                ├─ errPartialContent → 部分内容 + 黄色 minor 图标，Videos 被更新
-                                └─ nil → 干净内容，scheduleNextUpdate() 归零退避，1h 后再见
-            ↓ 释放锁，渲染模板返回 HTML
-                ↓ Render()
-                    ├─ style=="grid-cards" → videos-grid.html → 复用 video-card-contents.html
-                    ├─ style=="vertical-list" → videos-vertical-list.html（完全独立分支）
-                    └─ default → videos.html → 横向轮播，复用 video-card-contents.html
-                        └─ <img loading="lazy" src="YouTube CDN">  ← 浏览器懒加载+CDN缓存
+        ↓ handlePageContentRequest()
+            │  ⚠ 无 handler 级 context 超时
+            │  ⚠ widget 内部错误一律返回 200，不体现在状态码
+            ↓ page.mu.Lock()  ← 🔒 整页全局互斥锁，所有同 slug 请求在此串行排队
+                ↓ page.updateOutdatedWidgets(context.Background())
+                    │  ⚠ 根 context，无 deadline
+                    ↓ 遍历所有 widget，调 requiresUpdate(now)
+                        ├─ nextUpdate.IsZero() → 首次必刷
+                        └─ now.After(nextUpdate) → 到期才刷
+                            ↓ widget.update(ctx)  并发 goroutine 执行
+                                │  wg.Add(1) / wg.Done()
+                                ├─ ... 其他 widget（天气、日历等，木桶效应）
+                                └─ videosWidget.update()
+                                    ↓ fetchYoutubeChannelUploads(Channels, ...)
+                                        ├─ 按前缀/UC 判定 → 构造 playlist_id 或 channel_id URL
+                                        ├─ 30 worker 并发 GET YouTube RSS（单请求 5s 超时）
+                                        ├─ XML → youtubeFeedResponseXml
+                                        ├─ TimePosted 解析失败→time.Now→置顶
+                                        ├─ 跨频道 sortByNewest()
+                                        └─ 截断到 Limit 条
+                                    ↓ canContinueUpdateAfterHandlingErr(err) 状态机：
+                                        ├─ errNoContent
+                                        │   ├─ ContentAvailable==false → 全屏 ERROR，下一次 1m/4m/9m... 后
+                                        │   └─ ContentAvailable==true  → 旧内容 + 红色 major 图标，保留旧 Videos
+                                        ├─ errPartialContent → 部分内容 + 黄色 minor 图标，Videos 被更新
+                                        └─ nil → 干净内容，scheduleNextUpdate() 归零退避，1h 后再见
+                ↓ wg.Wait()  ← ⏳ 阻塞到所有过期 widget 全部完成，最慢者决定锁释放时间
+                ↓ pageContentTemplate.Execute()  ← 整页渲染，仍在锁内
+            ↓ page.mu.Unlock()  ← 🔓 释放锁
+            ↓ 返回 HTTP 响应（只有模板失败才 500，其余一律 200）
+    ↓ response.text()  ← ⚠ 500 错误文本也会被当 HTML 塞进页面
+    ↓ pageContentElement.innerHTML = content
+    ↓ setupPopovers / setupCarousels / setupDynamicRelativeTime 等
+        ⚠ setupDynamicRelativeTime 每分钟只刷新相对时间文字，不重新拉内容
+    ↓ 页面进入 content-ready 状态，此后无自动内容刷新
+        ↓ Render()
+            ├─ style=="grid-cards" → videos-grid.html → 复用 video-card-contents.html
+            ├─ style=="vertical-list" → videos-vertical-list.html（完全独立分支）
+            └─ default → videos.html → 横向轮播，复用 video-card-contents.html
+                └─ <img loading="lazy" src="YouTube CDN">  ← 浏览器懒加载+CDN缓存
 ```
 
 整个流程的核心文件：
 
 - [widget-videos.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-videos.go) — 视频源聚合主逻辑
 - [widget.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget.go) — widget 基类（ContentAvailable 单向锁、Error/Notice 状态机、指数退避重试）
-- [glance.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/glance.go) — 请求驱动刷新链路（handlePageContentRequest → updateOutdatedWidgets）
-- [widget-utils.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-utils.go) — 并发 worker pool、XML/JSON 解码
+- [glance.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/glance.go) — 请求驱动刷新链路（handlePageContentRequest → page.mu 锁 → updateOutdatedWidgets → wg.Wait）
+- [config.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/config.go#L77-L92) — page 结构体定义（含全局互斥锁 `mu sync.Mutex`）
+- [widget-utils.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-utils.go) — defaultHTTPClient（5s 超时）、并发 worker pool、XML/JSON 解码
 - [widget-twitch-channels.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-twitch-channels.go) — 直播状态参考实现（稳定排序、LIVE UI、10min 缓存）
-- [widget-rss.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-rss.go) — ETag/Last-Modified 条件缓存参考实现
+- [widget-rss.go](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/widget-rss.go) — ETag/Last-Modified 条件缓存、304 处理参考实现
 - [video-card-contents.html](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/templates/video-card-contents.html) — 默认/网格样式卡片子模板
 - [videos-vertical-list.html](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/templates/videos-vertical-list.html) — 纵向列表独立渲染模板
 - [widget-base.html](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/templates/widget-base.html) — ERROR 面板、major/minor notice 图标条件渲染
-- [page.js](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/static/js/page.js) — 轮播、折叠、懒加载、相对时间更新（不做内容轮询）
+- [page.js](file:///d:/fz/0601/solo-dogfeeding/code/141-glance/internal/glance/static/js/page.js) — fetchPageContent（无超时/状态码检查/重试，标了 TODO）、轮播、折叠、懒加载、相对时间更新（不做内容轮询）
