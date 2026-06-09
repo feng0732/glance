@@ -285,10 +285,15 @@ mux.HandleFunc("GET /manifest.json", func(w http.ResponseWriter, r *http.Request
 })
 ```
 
-- `a.parsedManifest`：每次 `newApplication()` 时渲染一次存为 `[]byte`（热重载会重新渲染）。
+- `a.parsedManifest`：每次 `newApplication()` 时用 `executeTemplateToString(manifestTemplate, templateData{App: app})` 重新渲染并存为 `[]byte`（热重载会重新渲染）。模板变量依赖 `AppName`、`AppBackgroundColor`、`AppIconURL` 等配置项，只有这些配置变化时 manifest 内容才实际变化。
 - 模板中通过 `VersionedAssetPath("manifest.json")` 生成 URL：`/manifest.json?v=<CreatedAt.Unix()>`。
 
-> ServeMux 忽略查询字符串，`/manifest.json?v=1717900000` 仍命中 `GET /manifest.json`。`?v=` 参数用于绕过浏览器缓存（cache busting），每次进程重启 `CreatedAt` 变化即触发重新加载。
+> ServeMux 忽略查询字符串，`/manifest.json?v=1717900000` 仍命中 `GET /manifest.json`。`?v=` 参数用于 cache busting：由于 `a.CreatedAt = time.Now()` 在每次 `newApplication()` 时赋值，**每次热重载 `?v=` 都会变化**，即使 manifest 内容未变浏览器也会被强制重新请求。
+
+关键代码：
+- `CreatedAt` 赋值：[newApplication()](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L47-L54)
+- manifest 渲染：[newApplication()](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L224-L228)
+- `VersionedAssetPath` URL 生成：[glance.go:431-434](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L431-L434)
 
 #### (4) 用户自定义资源 `/assets/...`（2h 缓存，不限 HTTP 方法）
 
@@ -305,22 +310,52 @@ mux.Handle(
 - 读本地文件系统 `http.Dir`。
 - 配置中 `/assets/xxx` 形式的 URL 会通过 [resolveUserDefinedAssetPath()](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L272-L278) 自动拼接 `BaseURL` 前缀。
 
-#### (5) 用户自定义 CSS 文件（模板层版本化，非路由）
+#### (5) 用户自定义 CSS 文件（模板层版本化 + resolveUserDefinedAssetPath）
 
-`custom-css-file` 通过 [document.html:27](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/document.html#L27) 引用：
+`custom-css-file` 在 `newApplication()` 中先经过 [resolveUserDefinedAssetPath()](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L272-L278) 处理：若路径以 `/assets/` 开头则自动拼接 `BaseURL` 前缀；外部 URL（`http(s)://`）和其他路径原样保留。
+
+然后通过 [document.html:27](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/document.html#L27) 引用：
 
 ```html
 <link rel="stylesheet" href="{{ .App.Config.Theme.CustomCSSFile }}?v={{ .App.CreatedAt.Unix }}">
 ```
 
-手动追加 `?v=` 时间戳版本化，**不经过 Glance 路由**（由用户自行部署在 `/assets/...` 或外部 CDN 提供）。
+- `?v=` 时间戳 = `a.CreatedAt.Unix()`，**每次热重载都会变化**（与 CSS 文件本身是否修改无关）。
+- 如果 CSS 部署在 `/assets/...` 下，实际 HTTP 请求会经过 Glance 的 `/assets/{path...}` 路由，命中 2h `Cache-Control`；`?v=` 参数用于在热重载时绕过浏览器缓存强制刷新。
+- 如果 CSS 是外部 URL，则由外部服务器负责缓存策略，Glance 仅追加查询参数。
+
+关键代码：
+- resolveUserDefinedAssetPath 处理：[newApplication()](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L197)
+- 模板引用：[document.html:27](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/document.html#L27)
 
 #### 静态资源 URL 生成函数对比
 
-| 函数 | URL 形式 | 用途 | 缓存刷新时机 |
+| 函数 | URL 形式 | 用途 | URL 变化时机 |
 |:---|:---|:---|:---|
-| [StaticAssetPath(asset)](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L427-L429) | `/static/{hash}/{asset}` | 内嵌 JS / CSS / 字体 / 图标 | 进程重启（`staticFSHash` 是包级 var，hash 变化） |
-| [VersionedAssetPath(asset)](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L431-L434) | `{asset}?v={CreatedAt}` | manifest.json 等 | 进程重启（`a.CreatedAt` 变化） |
+| [StaticAssetPath(asset)](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L427-L429) | `/static/{hash}/{asset}` | 内嵌 JS / CSS / 字体 / 图标 | 进程重启（`staticFSHash` 是包级 var，热重载不变） |
+| [VersionedAssetPath(asset)](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/glance.go#L431-L434) | `{asset}?v={CreatedAt}` | manifest.json 等 | 每次热重载（`a.CreatedAt = time.Now()` 在 newApplication() 中赋值） |
+| `Theme.CustomCSSFile`（模板层） | `{CustomCSSFile}?v={CreatedAt}` | 用户自定义 CSS | 每次热重载（同上 `CreatedAt` 变化） |
+
+---
+
+### 资源版本号变化时机汇总（热重载 vs 重启）
+
+| 资源 | 版本号来源 | 热重载时 URL 变化？ | 进程重启时 URL 变化？ | 内容实际变化？ |
+|:---|:---|:---:|:---:|:---|
+| `/static/{hash}/...`（内嵌） | `staticFSHash`（包级 var，MD5 内嵌 FS） | ❌ | ✅ | 仅代码修改重新编译后变化；热重载时内嵌 FS 不变 |
+| `/static/{hash}/css/bundle.css` | `bundledCSSContents`（包级 var） | ❌ | ✅ | 同上 |
+| `/manifest.json?v=xxx` | `a.CreatedAt.Unix()`（每次 newApplication 赋值） | ✅ | ✅ | 仅当 Branding 配置（AppName/BackgroundColor/AppIconURL）变化时内容变 |
+| `custom-css-file?v=xxx` | `a.CreatedAt.Unix()` | ✅ | ✅ | 与 CSS 文件是否修改**无关**；URL 变强制浏览器重取 |
+| `Branding.LogoURL`（用户自定义 `/assets/...`） | 无版本化，依赖 `/assets/` 的 2h Cache-Control | ❌ | ❌ | 文件系统实时读；浏览器缓存 2h；热重载后需手动清缓存或等 2h 过期 |
+| `Branding.FaviconURL`（用户自定义 `/assets/...`） | 同上 | ❌ | ❌ | 同上 |
+| `Branding.AppIconURL`（用户自定义 `/assets/...`） | 同上 | ❌ | ❌ | 同上 |
+| `/assets/...` 通用 | 同上 | ❌ | ❌ | 同上 |
+
+> **版本化策略不一致说明：**
+> - 内嵌静态资源（`/static/{hash}/`）通过内容 hash 做 URL 指纹，热重载不变
+> - manifest.json 和 custom-css-file 通过 `?v=<CreatedAt>` 做 cache busting，每次热重载 URL 都变（"过度失效"）
+> - LogoURL / FaviconURL / AppIconURL 如果用户自定义为 `/assets/...`，则**完全没有 URL 版本化**，仅依赖 `/assets/` 的 2h Cache-Control — 修改这些资源后用户可能需要等 2 小时或手动清缓存才能看到新内容
+> - LogoURL / FaviconURL / AppIconURL 代码位置：模板引用见 [page.html:22](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/page.html#L22)、[document.html:22](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/document.html#L22)、[document.html:24](file:///d:/fz/0601/solo-dogfeeding/code/145-glance/internal/glance/templates/document.html#L24) — 均无 `?v=` 参数
 
 ---
 
