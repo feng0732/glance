@@ -2,7 +2,7 @@
 
 ## 一、整体流程概览
 
-从 YAML 配置到最终 HTML 输出的完整链路：
+从 YAML 配置到最终 HTML 输出的完整链路，采用**两段式渲染**（首屏骨架 + 异步内容填充）：
 
 ```
 YAML 配置文件
@@ -11,12 +11,57 @@ parseYAMLIncludes() → parseConfigVariables() → yaml.Unmarshal()
     ↓
 config 结构体（含 Pages、Columns、Widgets）
     ↓ (glance.go: newApplication)
-newApplication() - 初始化页面 slug、主列索引、widget provider
-    ↓ (glance.go: handlePageRequest)
-HTTP 请求 → 查找 page → 构造 templateData → pageTemplate.Execute()
-    ↓ (template 渲染)
-document.html → page.html → page-content.html → widget-base.html → 各 widget 模板
+newApplication() - 初始化页面 slug、主列索引、widget provider、主题预设（含 default-dark 条件纳入）
+    │
+    ├─────────────────────────────┐
+    │                               │
+    ▼                               ▼
+首屏骨架接口                      内容接口
+handlePageRequest               handlePageContentRequest
+    │                               │
+    │ GET /{page}                   │ GET /api/pages/{page}/content/
+    │ populateTemplateRequestData   │ page.mu.Lock()
+    │   ├─ 从 cookie 读取主题 key    │ updateOutdatedWidgets()
+    │   │   在 Presets 中查找匹配项   │ pageContentTemplate.Execute()
+    │   └─ 未选择或未命中则回退
+    │       到全局默认主题（Key="default"）
+    │ pageTemplate.Execute()
+    │
+    ▼
+pageTemplate（page.html + document.html + footer.html）
+  输出内容包含：
+    ├─ <html data-theme="..." data-scheme="...">     ← 主题属性（前端主题切换时直接修改）
+    ├─ <script> pageData {slug, baseURL, theme}       ← JS 数据桥（条件输出slug）
+    ├─ <style id="theme-style"> 内联主题 CSS          ← 当前主题样式（newApplication阶段预渲染）
+    ├─ 主题选择器按钮 HTML                              ← 主题预览（newApplication阶段预渲染）
+    ├─ <div id="page-content"></div>                  ← 空容器（待内容接口填充）
+    ├─ <div class="page-loading-container">           ← Loading 图标
+    └─ <script type="module" src="page.js">           ← ES Module（浏览器 defer 执行）
+    │
+    ▼
+DOM 解析完成 → page.js 末尾 `setupPage();` 自动执行
+    ├─ initThemePicker()        ← 主题选择器（骨架中已有 DOM，立即可初始化）
+    └─ fetchPageContent(pageData) → GET ${baseURL}/api/pages/${slug}/content/
+    │
+    ▼
+handlePageContentRequest 返回 page-content.html 纯 HTML 片段
+  （head-widgets + page-columns + widgets，不含任何 <script>）
+    │
+    ▼
+pageContentElement.innerHTML = pageContent
+    ├─ setupPopovers(), setupClocks(), setupCalendars()...
+    ├─ setupMasonries()         ← split-column 列分配（依赖 DOM 尺寸）
+    └─ finally:
+        ├─ pageElement.classList.add("content-ready")   ← CSS 切换：隐藏 loading，显示内容
+        ├─ 触发 contentReadyCallbacks
+        └─ 300ms 后添加 .page-columns-transitioned      ← 启用列动画
+    ▼
+页面可交互
 ```
+
+**两条独立的模板渲染链**：
+- **骨架链**：`pageTemplate` = page.html 引入 document.html，document.html 定义骨架，page.html 覆盖各 block，最终由 page.html 引入 footer.html
+- **内容链**：`pageContentTemplate` = page-content.html 遍历 `.Render()` 调用各 widget 的 `renderTemplate()` → 具体 widget 模板（如 split-column.html）`{{ template "widget-base.html" . }}` → widget-base.html
 
 ---
 
@@ -86,21 +131,31 @@ func (a *application) handlePageContentRequest(w http.ResponseWriter, r *http.Re
 ### 3.1 模板文件依赖图
 
 ```
-mustParseTemplate() 函数用于构建模板依赖树：
+mustParseTemplate() 函数用于构建独立的模板变量，模板之间不是单一继承树，而是通过以下两种方式关联：
 
-pageTemplate
-├── page.html              (主模板)
-│   ├── document.html      (基础 HTML 骨架)
-│   │   └── footer.html    (页脚)
-│   └── (通过 block 覆盖注入内容)
+1. Go template 的 {{ template }} 指令（编译期关联）
+2. Go 代码调用 widget.Render() 方法（运行期关联）
 
-pageContentTemplate
-└── page-content.html      (页面主体内容)
+pageTemplate（page.html + document.html + footer.html，三个文件编译到同一个 *template.Template）
+├── page.html
+│   ├── {{ template "document.html" . }}  ← 引入 document.html 定义的骨架
+│   ├── {{ define "block-name" }}        ← 覆盖 document.html 中声明的各个 block
+│   └── {{ template "footer.html" . }} ← 单独引入 footer
+├── document.html                       ← 定义 <html>/<head>/内联脚本/可覆盖 block
+└── footer.html                         ← 独立模板文件，由 page.html 引入
 
-各 Widget 模板（以 clock 为例）
-clockWidgetTemplate
-├── clock.html             (widget 具体内容)
-│   └── widget-base.html   (所有 widget 的通用外壳)
+pageContentTemplate（page-content.html）
+└── page-content.html
+    └── {{ range .Page.Columns }}{{ range .Widgets }}{{ .Render }}{{ end }}{{ end }}
+        └── ↑ 这是调用 Go 接口方法 widget.Render()，不是 {{ template }}
+            每个 widget 内部持有自己独立的 *template.Template 变量
+
+各 Widget 独立模板变量（编译期互不关联，运行期通过 .Render() 串联）
+clockWidgetTemplate        → clock.html
+                            └── {{ template "widget-base.html" . }}
+splitColumnWidgetTemplate  → split-column.html
+                            └── {{ template "widget-base.html" . }}
+...（每个 widget 类型一个独立的模板变量）
 ```
 
 模板初始化代码在 [glance.go:20-24](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/glance.go#L20-L24)：
@@ -115,7 +170,31 @@ var (
 
 #### document.html - 基础骨架
 
-[document.html](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/templates/document.html) 定义了完整 HTML 文档结构，暴露多个可覆盖 block：
+[document.html](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/templates/document.html) 定义了完整 HTML 文档结构，是骨架与内容接口协作的关键数据注入点：
+
+1. **`<html>` 标签上的主题属性**：
+   ```html
+   <html lang="en" id="top" data-theme="{{ .Request.Theme.Key }}" data-scheme="{{ if .Request.Theme.Light }}light{{ else }}dark{{ end }}">
+   ```
+   `data-theme` 存当前主题 key，`data-scheme` 存 light/dark，供 CSS 选择器控制配色（如 `:root[data-scheme=light]`）。前端切换主题时直接修改这两个属性。
+
+2. **内联脚本 `pageData`**：将数据暴露给前端 JS，其中 `slug` 为条件输出：
+   ```html
+   <script>
+   if (navigator.platform === 'iPhone') document.documentElement.classList.add('ios');
+   const pageData = {
+       /*{{ if .Page }}*/slug: "{{ .Page.Slug }}",/*{{ end }}*/
+       baseURL: "{{ .App.Config.Server.BaseURL }}",
+       theme: "{{ .Request.Theme.Key }}",
+   };
+   </script>
+   ```
+   - `/*{{ if .Page }}*/.../*{{ end }}*/` 是用 JS 注释包裹 Go 模板的技巧：只有页面渲染时如果 `.Page` 存在，注释被展开为真实字段；如果不存在，JS 注释保留，整行在 JS 中仍是合法语法不影响。
+   - `slug` 是 `fetchPageContent()` 构造 URL 的核心参数。
+
+3. **内联主题 CSS**：将 `theme.CSS`（由 theme-style.gotmpl 渲染生成）写入 `<style id="theme-style">`，主题切换时前端直接替换该 `<style>` 的文本。
+
+4. **暴露可覆盖 block**：
 
 | Block 名称 | 作用 |
 |-----------|------|
@@ -262,15 +341,24 @@ CSS 定义在 [site.css:135-148](file:///d:/fz/0601/solo-dogfeeding/code/134-gla
 - 2 列：`[full, small]` 或 `[small, full]`
 - 3 列：`[small, full, small]` 或 `[full, full, small]`
 
-### 4.4 Split-Column Widget 的瀑布流布局
+### 4.4 Split-Column Widget 的多列轮询分配布局
 
-[split-column.html](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/templates/split-column.html) 使用 CSS Masonry 布局：
+[split-column.html](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/templates/split-column.html) 将所有子 widget 按配置顺序平铺为 `.masonry` 容器的直接子节点：
 
 ```html
 <div class="masonry" data-max-columns="{{ .MaxColumns }}">
 ```
 
-JS 逻辑在 [masonry.js](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/static/js/masonry.js) 中实现，根据 `data-max-columns` 属性将子元素动态分配到多列中。
+**前后端协作分工**：
+- **后端**：只输出子元素的 HTML 顺序，不做任何列分配。`MaxColumns` 通过 `data-max-columns` 传递给前端；未配置时后端默认设为 2。模板未输出 `data-min-column-width`，该属性在代码层支持但当前未使用。
+- **前端**：[masonry.js](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/static/js/masonry.js) 完全接管布局：
+  - `minColumnWidth`：`container.dataset.minColumnWidth || 330`，代码层支持 HTML data 属性覆盖，但模板未传，始终使用 330px
+  - `maxColumns`：`container.dataset.maxColumns || 6`，前端 fallback 为 6，但后端 split-column 默认传 2，因此实际生效值为 2
+  - 核心策略：Round-Robin 轮询，`i % columnsCount` 按顺序循环分配到各列
+  - 元素引用缓存：`Array.from(container.children)` 保存子元素引用，`textContent = ""` 清空后仍可重新 append
+- **渲染时序**：内容通过 `innerHTML` 注入后执行 `setupMasonries()`，此时 `.page-content` 仍为 `display:none`，首次列数可能不准确；`ResizeObserver` 在元素变为可见时再次触发重新分配，确保最终正确
+
+详见第八章完整实现分析。
 
 ---
 
@@ -394,17 +482,44 @@ Glance 采用"首屏骨架 + 异步内容填充"的两段式渲染架构：
 - **渲染模板**：`pageTemplate`（page.html + document.html + footer.html）
 - **包含内容**：HTML doctype、head（CSS/主题/meta）、导航栏、`#page` 容器、空的 `#page-content`、loading 动画、footer
 - **不做的事**：不更新 widget，不渲染任何具体 widget 内容
-- **注入 JS 数据**：通过内联脚本将 `pageData`（slug、baseURL、当前主题）暴露给前端
+- **注入 JS 数据**：通过内联脚本将 `pageData`（slug、baseURL、当前主题 key）暴露给前端
 
-模板中注入的数据（[page.html:5-12](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/templates/document.html#L5-L12)）：
+模板中注入的数据（[document.html:5-12](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/templates/document.html#L5-L12)）：
 ```html
 <script>
+if (navigator.platform === 'iPhone') document.documentElement.classList.add('ios');
 const pageData = {
-    slug: "{{ .Page.Slug }}",
+    /*{{ if .Page }}*/slug: "{{ .Page.Slug }}",/*{{ end }}*/
     baseURL: "{{ .App.Config.Server.BaseURL }}",
     theme: "{{ .Request.Theme.Key }}",
 };
 </script>
+```
+
+**pageData 三个字段的来源**：
+
+| 字段 | 注入位置 | 数据来源 |
+|------|---------|---------|
+| `slug` | `{{ .Page.Slug }}` | 若 YAML 中未配置则由 `titleToSlug(page.Title)` 在 `newApplication` 中生成 |
+| `baseURL` | `{{ .App.Config.Server.BaseURL }}` | YAML 配置 `server.base-url`，空字符串时由中间件从 request URL 动态填充 |
+| `theme` | `{{ .Request.Theme.Key }}` | `populateTemplateRequestData()` 从 cookie 读取用户选择的主题 key，在 `Presets` 中查找匹配项；若未选择或找不到则回退到全局默认主题，其 Key 恒为 `"default"` |
+
+`theme` 字段的完整解析流程在 [glance.go:290-304](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/glance.go#L290-L304)：
+```go
+func (a *application) populateTemplateRequestData(data *templateRequestData, r *http.Request) {
+    theme := &a.Config.Theme.themeProperties         // 默认：全局默认主题
+
+    if !a.Config.Theme.DisablePicker {
+        selectedTheme, err := r.Cookie("theme")       // 读 cookie
+        if err == nil {
+            preset, exists := a.Config.Theme.Presets.Get(selectedTheme.Value)
+            if exists {
+                theme = preset                         // 命中用户预设
+            }
+        }
+    }
+    data.Theme = theme
+}
 ```
 
 #### 接口二：页面内容片段

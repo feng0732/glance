@@ -4,7 +4,7 @@
 
 ```
 文件系统
-    ↓ (cli.go / main.go 入口)
+    ↓ (根 main.go → cli.go cobra serve 命令 RunE → glance.ServeApp → internal/glance/main.go)
 parseYAMLIncludes(mainFilePath)
     └── recursiveParseYAMLIncludes()  —— 递归处理 $include: 指令
     ↓
@@ -334,9 +334,20 @@ func (w *widgetBase) withTitle(title string) *widgetBase {
 }
 ```
 
-#### 阶段三：应用级默认与规范化
+#### 阶段三：主题默认值与预设注入（最先执行）
 
-在 [newApplication](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/glance.go#L47-L231) 中：
+在 [newApplication](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/glance.go#L104-L141) 中最先执行，为后续 Branding 等模块提供主题数据。核心代码与详细分析见下文 5.1.3.1 - 5.1.3.5。
+
+**此阶段产出的核心数据：**
+- default-dark：条件满足时纳入可选项，实际样式 = main.css `:root` 的 CSS 默认值（零值 themeProperties 不生成覆盖 CSS）
+- default-light：无条件纳入，Go 代码中显式定义浅色配色值
+- 用户自定义预设：通过 `Merge()` 覆盖同名内置预设，追加到末尾
+- `config.Theme.Key = "default"`：全局默认主题的 Key 恒为 `"default"`
+- 每个预设的 `styleCSS`（内联 CSS）和 `previewHTML`（主题选择器按钮 HTML）预渲染完成
+
+#### 阶段四：应用级默认与规范化（依赖阶段三主题初始化完成）
+
+在 `newApplication` 中主题初始化之后执行：
 
 | 字段 | 默认值逻辑 |
 |------|-----------|
@@ -345,15 +356,15 @@ func (w *widgetBase) withTitle(title string) *widgetBase {
 | `page.DesktopNavigationWidth` | 未设置时继承 `page.Width` |
 | `config.Branding.AppName` | `"Glance"` |
 | `config.Branding.AppIconURL` | 默认 app-icon.png |
-| `config.Branding.AppBackgroundColor` | 主题背景色的 HEX 值 |
+| `config.Branding.AppBackgroundColor` | **依赖阶段三**：主题背景色的 HEX 值（`config.Theme.BackgroundColor`） |
 | `config.Branding.FaviconURL` | 默认 favicon.svg |
 | `splitColumnWidget.MaxColumns` | `< 2` 时设为 `2` |
 
-#### 阶段四：主题默认值与预设注入
+---
 
-这是最复杂的默认值合并阶段，涉及条件判断、多层合并和优先级规则。核心代码在 [glance.go:104-141](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/glance.go#L104-L141)。
+#### 5.1.3.1 default-dark 何时被纳入可选项
 
-##### 4.1 default-dark 何时被纳入可选项
+（阶段三的详细分析，核心代码在 [glance.go:104-141](file:///d:/fz/0601/solo-dogfeeding/code/134-glance/internal/glance/glance.go#L104-L141)）
 
 ```go
 defaultDarkTheme, ok := config.Theme.Presets.Get("default-dark")
@@ -381,7 +392,7 @@ if ok && !config.Theme.SameAs(defaultDarkTheme) || !config.Theme.SameAs(&themePr
 | 用户自定义了 default-dark，但与全局默认主题完全相同 | true | false | - | 取决于 C | 取决于用户是否还改了全局默认主题 |
 | 用户没定义 default-dark，但修改了全局默认主题（如全局 theme.backgroundColor） | - | - | true | true | **纳入**。默认主题已被用户自定义，需要提供"恢复原厂暗色"的选项 |
 
-##### 4.2 default-dark 的实际样式内容
+#### 5.1.3.2 default-dark 的实际样式内容
 
 `themeProps = append(themeProps, &themeProperties{})` 传入的是零值结构体。零值 `themeProperties` 所有字段为 nil，这意味着：
 
@@ -396,7 +407,7 @@ if ok && !config.Theme.SameAs(defaultDarkTheme) || !config.Theme.SameAs(&themePr
 
 因此 **default-dark 的实际值 = main.css 中 `:root` 的 CSS 默认值**，而不是在 Go 代码中重新定义的。
 
-##### 4.3 default-light 的无条件纳入
+#### 5.1.3.3 default-light 的无条件纳入
 
 ```go
 themeKeys = append(themeKeys, "default-light")
@@ -412,7 +423,7 @@ themeProps = append(themeProps, &themeProperties{
 
 与 default-dark 不同，**default-light 总是被无条件加入**，无论用户是否修改主题。这是因为浅色主题与默认深色主题差异巨大，几乎所有场景下用户都需要切换选项。
 
-##### 4.4 预设合并与优先级
+#### 5.1.3.4 预设合并与优先级
 
 ```go
 themePresets, err := newOrderedYAMLMap(themeKeys, themeProps)
@@ -433,7 +444,7 @@ theme:
 ```
 则主题选择器中的 "default-light" 显示纯白背景而非内置的 hsl(240, 13%, 95%)。
 
-##### 4.5 主题 Key 与初始化
+#### 5.1.3.5 主题 Key 与初始化
 
 ```go
 for key, properties := range config.Theme.Presets.Items() {
@@ -550,34 +561,37 @@ func (w *widgetBase) renderTemplate(data any, t *template.Template) template.HTM
 
 ## 七、配置加载完整调用链
 
-以 CLI 启动为例的完整调用顺序：
+以 CLI 启动 `glance serve --config glance.yml` 为例的完整调用顺序：
 
 ```
-main.go → cli.go
+main.go (根入口)
     ↓
-loadConfig() (cli.go 中)
+cli.go (cobra serve 命令的 RunE)
     ↓
-parseYAMLIncludes(configFilePath)
-    └── recursiveParseYAMLIncludes() × N
-    ↓
-parseConfigVariables(mergedContents)
-    ↓
-newConfigFromYAML(processedContents)
-    ├── config.Server.Port = 8080
-    ├── yaml.Unmarshal(contents, config)
-    ├── isConfigStateValid(config)
-    └── 遍历 pages → headWidgets / columns → widgets
-        └── widget.initialize() （含默认值设置）
-    ↓
-newApplication(config)
-    ├── Auth 初始化（密码哈希、密钥解码）
-    ├── Theme 初始化（预设合并、CSS 生成）
-    ├── Pages 预处理（slug、宽度、主列索引、provider 注入）
-    ├── Branding 默认值填充
-    └── manifest.json 预渲染
-    ↓
-server() → 注册路由 → ListenAndServe
+glance.ServeApp(configPath) → [internal/glance/main.go]
+    ├── parseYAMLIncludes(configPath)
+    │   └── recursiveParseYAMLIncludes() × N  ← 递归展开 $include
+    ├── 启动 configFilesWatcher (fsnotify)
+    │   └── onChange 回调（首次启动立即触发一次）
+    │       ├── parseConfigVariables(newContents) ← ${ENV_VAR} 等变量替换
+    │       ├── newConfigFromYAML(processedContents)
+    │       │   ├── config.Server.Port = 8080
+    │       │   ├── yaml.Unmarshal(contents, config)
+    │       │   ├── isConfigStateValid(config)
+    │       │   └── 遍历 pages → headWidgets / columns → widgets
+    │       │       └── widget.initialize() （含默认值设置）
+    │       ├── newApplication(config)
+    │       │   ├── Auth 初始化（密码哈希、密钥解码）
+    │       │   ├── Theme 初始化（预设合并、CSS 生成）
+    │       │   ├── Pages 预处理（slug、宽度、主列索引、provider 注入）
+    │       │   ├── Branding 默认值填充
+    │       │   └── manifest.json 预渲染
+    │       └── app.server() → 注册路由 → ListenAndServe
+    │
+    └── 降级路径（watcher 启动失败时）：直接顺序执行上述 onChange 中的步骤
 ```
+
+注：热重载场景下，文件变更触发 `onChange` 再次执行，此时会先停旧服务再启动新服务（见第八、九章）。
 
 ---
 
@@ -632,9 +646,11 @@ func serveApp(configPath string) error {
     }
 
     // ── 启动文件监听器 ──
+    // configFilesWatcher 内部会在启动时立即触发一次 onChange（作为首次启动）
+    // 之后每次文件变更再触发 onChange（热重载）
     stopWatching, err := configFilesWatcher(configPath, configContents, configIncludes, onChange, onErr)
     if err == nil {
-        defer stopWatching()               // 正常：通过热重载启动
+        defer stopWatching()               // 正常路径：首次启动 + 后续热重载均走 onChange
     } else {
         // 降级路径：监听器启动失败（如 fsnotify 不支持）
         // 跳过热重载，直接加载配置启动一次
