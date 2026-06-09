@@ -196,35 +196,212 @@ proxy:
 
 ---
 
-## 5. 默认值合并
+## 5. 阶段一内部：newConfigFromYAML 的精确执行顺序与状态变化
 
-默认值的设置分散在**两个阶段**：
+**核心函数**: [newConfigFromYAML](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L94-L129)
 
-### 阶段 A：YAML 反序列化前（硬编码默认值）
+此前对"阶段一"的描述存在误导——阶段一并非纯"只读校验"，它包含**6 个顺序步骤**，其中步骤 2、4、6 都会修改 config 或 widget 的内部状态：
 
-[newConfigFromYAML](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L94-L129) 中：
-
-```go
-config := &config{}
-config.Server.Port = 8080   // 唯一在此阶段设置的默认值
+```
+Step 1  parseConfigVariables(contents)      ← 修改变量字节流（不涉及 config 对象）
+   ↓
+Step 2  config := &config{}
+        config.Server.Port = 8080           ← 写入默认端口（⚠️ 在 Unmarshal 之前）
+   ↓
+Step 3  yaml.Unmarshal(contents, config)    ← YAML 字段覆盖零值和 8080 默认值
+   ↓
+Step 4  isConfigStateValid(config)          ← 只读校验，不修改数据
+   ↓
+Step 5  遍历 pages/columns/widgets
+        widget.initialize()                 ← 修改 widget 内部状态（标题、缓存策略、预渲染等）
+   ↓
+Step 6  return config
 ```
 
-### 阶段 B：应用初始化时（派生/计算默认值）
+### Step 1：变量插值（字节流层面，不涉及 config 对象）
 
-[newApplication](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/glance.go#L47-L231) 中集中处理：
+见第 2 章。输入/输出均为 `[]byte`。
 
-| 字段 | 默认值逻辑 |
-|------|-----------|
-| page.Slug | 为空则 `titleToSlug(page.Title)` |
-| page.Width | `"default"` → 置空 |
-| page.DesktopNavigationWidth | 为空则继承 page.Width |
-| page.PrimaryColumnIndex | 第一个 size=full 的列下标 |
-| Branding.AppName | 空 → `"Glance"` |
-| Branding.FaviconURL | 空 → `/static/<hash>/favicon.svg` |
-| Branding.FaviconType | 根据后缀推断 `image/svg+xml` / `image/png` |
-| Branding.AppIconURL | 空 → `/static/<hash>/app-icon.png` |
-| Branding.AppBackgroundColor | 空 → 主题背景色的 HEX 值 |
-| Server.BaseURL | 自动去除末尾 `/` |
+### Step 2：写入 Port 默认值（在 Unmarshal 之前）
+
+```go
+config := &config{}         // 所有字段为 Go 零值：Port=0, 字符串="", 切片=nil, map=nil
+config.Server.Port = 8080   // 先写入默认值
+```
+
+**关键细节**：这是一个**Unmarshal 前默认值**策略——先写 8080，再让 YAML 决定是否覆盖。如果用户 YAML 里写了 `server.port: 9090`，Unmarshal 会把 8080 覆盖成 9090；如果没写，就保留 8080。
+
+这也是整个阶段一里**唯一在 Unmarshal 之前被硬编码**的字段。其他所有字段在 Step 3 之前都保持 Go 零值。
+
+### Step 3：yaml.Unmarshal 递归填充结构体
+
+涉及的自定义 UnmarshalYAML（见第 3 章）：
+- `hslColorField.UnmarshalYAML` — 解析 HSL 颜色
+- `durationField.UnmarshalYAML` — 解析 `30s/5m/2h/1d`
+- `customIconField.UnmarshalYAML` — 解析图标前缀（si:/mdi:/di:/sh:）
+- `proxyOptionsField.UnmarshalYAML` — 解析代理（简写 URL 或完整对象），并构造 `*http.Client`
+- `queryParametersField.UnmarshalYAML` — 归一化为 `map[string][]string`
+- `orderedYAMLMap.UnmarshalYAML` — 保序的键值对映射
+- `widgets.UnmarshalYAML` — 按 type 工厂创建具体 widget 结构体
+
+**状态变化**：所有 `yaml` tag 标记的字段被填充；`yaml:"-"` 字段（如 `PrimaryColumnIndex`、`user.PasswordHash`、`widgetBase.ID` 等）在此阶段仍为零值。
+
+### Step 4：isConfigStateValid 只读校验
+
+见第 4 章。不修改任何数据。
+
+### Step 5：Widget initialize()——阶段一最隐蔽的状态修改
+
+[newConfigFromYAML#L112-L126](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L112-L126) 按 `pages → headWidgets`、`pages → columns → widgets` 两层嵌套遍历，对每个 widget 调用 `initialize()`。
+
+每个 widget 的 `initialize()` 会修改以下内部状态（`yaml:"-"` 字段）：
+
+| 修改操作 | 辅助方法 | 说明 |
+|---------|---------|------|
+| 默认标题 | `withTitle("Videos")` | `w.Title == ""` 时才写入，用户 YAML 写了 title 则不覆盖 |
+| 默认标题链接 | `withTitleURL("https://...")` | 同上，空则写入 |
+| 缓存策略 | `withCacheDuration(2*time.Hour)` / `withCacheOnTheHour()` | 设置 `cacheType` 和 `cacheDuration`；若用户写了 `cache:` 字段（`CustomCacheDuration > 0`）则优先用用户值 |
+| 内容可用标记 | `withError(nil)` | 若 `ContentAvailable == false`，置为 `true` |
+| 特有字段默认值 | — | 如 `rssWidget.Limit <= 0 → Limit=5`、`videosWidget.Limit <= 0 → Limit=5` 等 |
+| 预渲染 HTML | — | 如 `todoWidget` 在 initialize 时就执行 `renderTemplate` 写入 `cachedHTML` |
+| WIP 标记 | — | 如 `serverStatsWidget` 将 `WIP = true` |
+
+**为什么放在阶段一而不是阶段二？**
+- initialize 属于 widget 自身的"反序列化后自洽"逻辑，不依赖 application 上下文（不需要 `slugToPage`、`authSecretKey`、`providers` 等）
+- 但 `widget.setProviders()` 是在**阶段二**执行的，因为 provider 需要 `app.StaticAssetPath`
+
+### 阶段一出口时的状态快照
+
+| 类别 | 状态 |
+|------|------|
+| `Server.Port` | 用户值或 8080 |
+| 所有 YAML tag 字段 | 已填充 |
+| `yaml:"-"` 运行时字段 | 除 widget 内部（cacheType/Title 等）外，大多仍为零值（如 `PrimaryColumnIndex=-?` 实际为 0） |
+| widget 内部 | `initialize()` 已执行，默认标题/缓存策略/预渲染已写入 |
+| Auth 密码 | 明文仍在 `user.Password` 字段，未哈希 |
+| Theme CSS / BackgroundColorAsHex | 尚未计算 |
+| slugToPage / widgetByID | 尚未建立索引 |
+
+---
+
+## 6. 阶段二内部：newApplication 的执行顺序与默认值依赖链
+
+**核心函数**: [newApplication](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/glance.go#L47-L231)
+
+阶段二的默认值分为**归一化**（将 YAML 值规范为内部表示）、**继承**（从已有字段取值）、**派生**（基于其他字段计算新值）三类，且有严格的执行顺序，后一步依赖前一步的输出：
+
+```
+Step 1   Config 复制到 app.Config，取别名 config = &app.Config
+   ↓
+Step 2   Init Auth（密码哈希、secret 解码）
+   ↓
+Step 3   Init Theme Presets（内置 + 用户 Merge → presets.init()）
+   ↓
+Step 4   默认主题 config.Theme.init()  ← 计算出 BackgroundColorAsHex，后续 Branding 依赖
+   ↓
+Step 5   Init Pages
+   │      ├─ 5a PrimaryColumnIndex = -1（复位）
+   │      ├─ 5b Slug 空 → titleToSlug 派生
+   │      ├─ 5c Slug 保留字校验
+   │      ├─ 5d Width "default" → 置空（归一化）
+   │      ├─ 5e DesktopNavigationWidth 空 → 继承 Width（⚠️ 依赖 5d 归一化结果）
+   │      ├─ 5f 注册 head widgets（widgetByID + setProviders）
+   │      └─ 5g PrimaryColumnIndex = 第一个 full 列下标（注册时顺带计算）
+   ↓
+Step 6   URL 与 Branding 默认值
+   │      ├─ 6a BaseURL 去尾斜杠（归一化）
+   │      ├─ 6b CustomCSSFile / LogoURL 解析资产路径
+   │      ├─ 6c FaviconURL 空 → StaticAssetPath 派生
+   │      ├─ 6d FaviconType 根据 FaviconURL 后缀推断（依赖 6c）
+   │      ├─ 6e AppName 空 → "Glance"
+   │      ├─ 6f AppIconURL 空 → StaticAssetPath 派生
+   │      └─ 6g AppBackgroundColor 空 → Theme.BackgroundColorAsHex 派生（依赖 Step 4）
+   ↓
+Step 7   执行 manifest.json 模板（依赖上述所有字段的最终值）
+   ↓
+Step 8   return app
+```
+
+### Step 2：Auth 初始化——将明文密码擦除为哈希
+
+```go
+// 仅当 len(Auth.Users) > 0 时执行
+secretBytes := base64.StdEncoding.DecodeString(config.Auth.SecretKey)  // 阶段一已保证非空
+// 校验长度 == AUTH_SECRET_KEY_LENGTH (64 字节)
+
+for username := range config.Auth.Users {
+    user := config.Auth.Users[username]
+    if user.PasswordHashString != "" {
+        user.PasswordHash = []byte(user.PasswordHashString)
+        user.PasswordHashString = ""          // 擦除中间字段
+    } else {
+        user.PasswordHash = bcrypt.Hash(user.Password)
+        user.Password = ""                    // ⚠️ 擦除明文密码
+    }
+}
+```
+
+**状态变化**：`user.Password` 和 `user.PasswordHashString` 被置空，敏感信息转移到 `yaml:"-"` 的 `PasswordHash` 字段。
+
+### Step 3-4：Theme 初始化——先 Merge 预设，再逐个 init()
+
+```go
+// Step 3: 构造内置预设 default-dark / default-light，与用户 presets Merge
+config.Theme.Presets = *themePresets.Merge(&config.Theme.Presets)
+
+// 遍历所有预设（包括被用户覆盖的内置预设）
+for key, properties := range config.Theme.Presets.Items() {
+    properties.Key = key
+    properties.init()          // 计算 CSS, PreviewHTML, BackgroundColorAsHex
+}
+
+// Step 4: 默认主题也执行 init()
+config.Theme.Key = "default"
+config.Theme.init()            // ⚠️ 这里计算出的 BackgroundColorAsHex 将在 Step 6g 被引用
+```
+
+[themeProperties.init()](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/theme.go#L56-L76) 的输出：
+- `CSS`: 由主题模板编译而成的样式
+- `PreviewHTML`: 主题选择器卡片的预览 HTML
+- `BackgroundColorAsHex`: 背景色的 HEX 字符串（若 BackgroundColor 为 nil 则兜底 `"#151519"`）
+
+### Step 5：Pages 初始化——归一化、继承、派生的顺序陷阱
+
+对每个 page 按以下子步骤顺序执行，**不能打乱**：
+
+```
+5a  page.PrimaryColumnIndex = -1         // 复位为"未找到"哨兵值
+5b  if page.Slug == "" → page.Slug = titleToSlug(page.Title)    // 派生
+5c  检查 page.Slug ∈ {"login","logout"} → 报错（保留字冲突）
+5d  if page.Width == "default" → page.Width = ""                // 归一化
+5e  if page.DesktopNavigationWidth == "" && != "default"
+       → page.DesktopNavigationWidth = page.Width               // ⚠️ 继承：依赖 5d 的结果
+5f  注册 head widgets 到 app.widgetByID; widget.setProviders(providers)
+5g  遍历 columns:
+       if PrimaryColumnIndex == -1 && column.Size == "full"
+           → PrimaryColumnIndex = int8(c)    // 命中第一个 full 列后不再改变
+       注册 column widgets 到 app.widgetByID; widget.setProviders
+```
+
+**关键依赖**：
+- `5e → 5d`：DesktopNavigationWidth 的继承必须在 Width 归一化之后执行。如果 YAML 写了 `width: default`，`5d` 先把它置为空字符串，`5e` 才会继承到正确的空值而不是字面量 `"default"`
+- `5g → 5a`：PrimaryColumnIndex 在循环前先设为 `-1`，确保多页面时不会残留上一页的值
+
+### Step 6：Branding 默认值——跨模块派生链
+
+```
+6a  BaseURL = TrimRight(BaseURL, "/")                            // 归一化
+6b  CustomCSSFile / LogoURL = resolveUserDefinedAssetPath(...)   // "/assets/xxx" 加 BaseURL 前缀
+6c  FaviconURL = 空 ? StaticAssetPath("favicon.svg") : resolve(...)   // 派生
+6d  FaviconType = HasSuffix(FaviconURL, ".svg") ? "image/svg+xml" : "image/png"   // 推断（依赖 6c）
+6e  AppName = 空 ? "Glance" : AppName                             // 派生
+6f  AppIconURL = 空 ? StaticAssetPath("app-icon.png") : AppIconURL  // 派生
+6g  AppBackgroundColor = 空 ? Theme.BackgroundColorAsHex : AppBackgroundColor  // 派生（⚠️ 依赖 Step 4 的 init() 结果）
+```
+
+**关键依赖**：
+- `6d → 6c`：FaviconType 基于 FaviconURL 的后缀判断，必须在 6c 确定最终 URL 之后
+- `6g → Step 4`：AppBackgroundColor 回退到主题背景色的 HEX 值，而 `BackgroundColorAsHex` 只有在 `theme.init()` 执行完才不为空。如果把 Step 6 放在 Step 4 之前，会拿到空字符串
 
 ### 主题预设合并（orderedYAMLMap.Merge）
 
@@ -243,11 +420,13 @@ config.Server.Port = 8080   // 唯一在此阶段设置的默认值
 
 ---
 
-## 6. Widget 初始化
+## 7. Widget 初始化（阶段一 Step 5 与阶段二 Step 5f/5g 的分工）
 
-YAML 反序列化完成后，遍历所有页面的 head-widgets 和 columns widgets，逐个调用 `initialize()`。
+Widget 的初始化跨越两个阶段，分工不同：
 
-[newConfigFromYAML](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L112-L126) 中：
+### 阶段一：widget.initialize()——自洽初始化
+
+在 [newConfigFromYAML#L112-L126](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L112-L126) 中执行：
 
 ```go
 for p := range config.Pages {
@@ -260,13 +439,30 @@ for p := range config.Pages {
 }
 ```
 
-`formatWidgetInitError` 将错误包装为 `<widget-type> widget: <原始错误>`，便于定位。
+`formatWidgetInitError` 将错误包装为 `<widget-type> widget: <原始错误>`，**但丢失行号**（YAML Node 已在反序列化完成后丢弃）。
+
+**职责**：设置默认标题、默认缓存策略、校验字段必填性（如 `redditWidget.Subreddit` 不能为空）、预渲染 HTML。不依赖 application 上下文。
+
+### 阶段二：widget.setProviders() + 索引注册
+
+在 [newApplication#L175-L193](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/glance.go#L175-L193) 中执行：
+
+```go
+for i := range page.HeadWidgets {
+    widget := page.HeadWidgets[i]
+    app.widgetByID[widget.GetID()] = widget      // 注册到全局索引
+    widget.setProviders(providers)                // 注入 assetResolver 依赖
+}
+// column widgets 同理
+```
+
+**职责**：注入依赖（`providers.assetResolver` 用于解析静态资产路径）、建立 ID→widget 的全局映射（供 API 路由使用）。必须在阶段二，因为需要 `app.StaticAssetPath`。
 
 ---
 
-## 7. 错误处理与聚合策略
+## 8. 错误处理与聚合策略
 
-### 7.1 Fail-Fast（快速失败）
+### 8.1 Fail-Fast（快速失败）
 
 整个配置加载链路采用**遇到第一个错误立即返回**的策略，不做错误聚合：
 
@@ -279,7 +475,7 @@ for p := range config.Pages {
 | Widget 初始化 | 逐个 initialize，第一个失败立即返回 |
 | 应用初始化 | 逐项初始化，第一个失败立即返回 |
 
-### 7.2 错误包装链
+### 8.2 错误包装链
 
 使用 `fmt.Errorf("%w", err)` 逐层包装，形成可读的错误链：
 
@@ -289,14 +485,14 @@ validating config file: page 1 has no columns
 parsing config: reading ./extra.yml: open ./extra.yml: no such file or directory
 ```
 
-### 7.3 运行时热重载的错误容忍
+### 8.3 运行时热重载的错误容忍
 
 [serveApp](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/main.go#L93-L181) 中的 `onChange` 回调：
 - **首次启动**: 配置无效 → 直接退出（关闭 exitChannel）
 - **运行中变更**: 配置无效 → 仅打日志，保留旧配置继续运行
 - Widget 运行时更新失败 → 仅记录在 widget.Error / widget.Notice，不影响全局
 
-### 7.4 文件监视器的错误传播
+### 8.4 文件监视器的错误传播
 
 - `watcher.Errors` channel → 通过 `onErr` 回调打日志
 - Watcher 初始化失败 → 降级为单次加载，不启用热重载
@@ -304,7 +500,7 @@ parsing config: reading ./extra.yml: open ./extra.yml: no such file or directory
 
 ---
 
-## 8. 文件热重载
+## 9. 文件热重载
 
 **核心函数**: [configFilesWatcher](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L305-L445)
 
@@ -332,7 +528,7 @@ debouncedParseAndCompareBeforeCallback (500ms 防抖)
 
 ---
 
-## 9. 相关文件速查
+## 10. 相关文件速查
 
 | 文件 | 职责 |
 |------|------|
@@ -342,14 +538,17 @@ debouncedParseAndCompareBeforeCallback (500ms 防抖)
 | [main.go](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/main.go) | CLI 入口、serveApp 热重载调度、校验/打印子命令 |
 | [widget.go](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go) | widgets 列表反序列化、widget 接口定义、基类 |
 | [auth.go](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/auth.go) | AUTH_SECRET_KEY_LENGTH 常量定义、会话 Token 生成与校验 |
+| [theme.go](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/theme.go) | themeProperties.init()、主题 CSS/HEX 计算、预设 SameAs 比较 |
 
 ---
 
-## 10. 边界条件与两阶段校验/默认值深度分析
+## 11. 边界条件与两阶段校验/默认值深度分析
 
-代码 TODO ([config.go#L447-L450](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L447-L450)) 已明确指出当前校验分散在两处，以下将易混淆的边界条件按**阶段一（配置加载与解析，只读校验）**与**阶段二（应用初始化与运行时，可修改数据）**进行拆分梳理。
+代码 TODO ([config.go#L447-L450](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L447-L450)) 已明确指出当前校验分散在两处。结合第 5、6 章的精确执行顺序分析，**两个阶段都会修改状态**：
+- **阶段一** = [newConfigFromYAML](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L94-L129)：端口默认值写入、YAML 反序列化、widget.initialize() 自洽初始化（共 6 步，其中 3 步修改状态）
+- **阶段二** = [newApplication](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/glance.go#L47-L231) + [serveApp onChange](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/main.go#L101-L146)：归一化/继承/派生默认值、密码哈希、主题 CSS 计算、索引注册、热重载错误分流（共 8 步，全部修改状态或索引）
 
-### 10.1 认证 secret-key 的两阶段校验
+### 11.1 认证 secret-key 的两阶段校验
 
 | 阶段 | 校验位置 | 校验内容 | 错误信息 | 原因说明 |
 |------|---------|---------|---------|---------|
@@ -363,9 +562,9 @@ debouncedParseAndCompareBeforeCallback (500ms 防抖)
 
 ---
 
-### 10.2 页面标识（Slug）与 full 列约束的两阶段处理
+### 11.2 页面标识（Slug）与 full 列约束的两阶段处理
 
-#### 10.2.1 Full 列约束
+#### 11.2.1 Full 列约束
 
 | 阶段 | 校验位置 | 内容 | 原因说明 |
 |------|---------|------|---------|
@@ -376,7 +575,7 @@ debouncedParseAndCompareBeforeCallback (500ms 防抖)
 - 前端渲染时"主列"只需一个锚点（通常放主要内容），第二个 full 列作为辅助
 - 若需要多主列语义，应由布局 CSS 处理，此处 `PrimaryColumnIndex` 仅用于内部逻辑定位
 
-#### 10.2.2 页面 Slug 处理
+#### 11.2.2 页面 Slug 处理
 
 | 阶段 | 处理位置 | 内容 | 原因说明 |
 |------|---------|------|---------|
@@ -389,7 +588,7 @@ debouncedParseAndCompareBeforeCallback (500ms 防抖)
 
 ---
 
-### 10.3 热重载：首次启动 vs 运行中报错的分流逻辑
+### 11.3 热重载：首次启动 vs 运行中报错的分流逻辑
 
 [serveApp](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/main.go#L93-L181) 用一个布尔标志 `hadValidConfigOnStartup` 控制错误分流。
 
@@ -433,7 +632,7 @@ serveApp() 启动
 
 ---
 
-### 10.4 Widget 反序列化报错定位精确分析
+### 11.4 Widget 反序列化报错定位精确分析
 
 [widgets.UnmarshalYAML](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L95-L124) 有 4 个可能的错误返回点，行号信息的完整性各不相同：
 
@@ -463,17 +662,28 @@ if err := config.Pages[p].HeadWidgets[w].initialize(); err != nil {
 
 ---
 
-### 10.5 两阶段边界条件汇总表
+### 11.5 两阶段执行步骤与边界条件汇总表
 
-| 关注点 | 阶段一（newConfigFromYAML + isConfigStateValid） | 阶段二（newApplication + serveApp onChange） |
-|--------|------------------------------------------------|----------------------------------------------|
-| **Auth secret-key** | ✅ 非空校验（有 users 时必须存在） | ✅ Base64 解码 + 精确 64 字节长度校验 + 密码哈希 |
-| **Full 列约束** | ✅ 列数上限 + size 枚举 + full∈{1,2} | ✅ PrimaryColumnIndex = 第一个 full 列下标（-1 兜底） |
-| **Page Slug** | ❌ 不处理 | ✅ 空则 titleToSlug 派生 + 保留字(login/logout)检查 + slugToPage 建索引 |
-| **页面 Width** | ✅ 枚举校验（wide/slim/default/空） | ✅ "default" → 置空归一化 |
-| **DesktopNavigationWidth** | ✅ 枚举校验（非空时） | ✅ 空则继承 page.Width |
-| **热重载错误分流** | ❌ 不涉及运行时 | ✅ hadValidConfigOnStartup 标志：首次失败退出、运行时失败保留旧配置 |
-| **Widget 反序列化** | ✅ 4 处错误点，仅 newWidget 失败手动加行号 | ✅ initialize() 错误包装为 type 前缀，但丢失行号 |
-| **默认值 Port** | ✅ Server.Port = 8080（Unmarshal 前硬编码） | — |
-| **默认值 Branding** | — | ✅ AppName/Favicon/AppIcon/BackgroundColor 派生默认值 |
-| **主题预设** | — | ✅ 内置 default-dark/light 与用户 presets 合并，用户值覆盖内置值 |
+#### 阶段一：newConfigFromYAML（6 步，3 步修改状态）
+
+| 步骤 | 操作 | 是否改状态 | 关键细节 / 陷阱 |
+|------|------|-----------|----------------|
+| 1 | `parseConfigVariables(contents)` | ✅（字节流） | `${env}` / `${secret:}` / `${readFileFromEnv:}` 插值；注释中的变量也会被替换 |
+| 2 | `config.Server.Port = 8080` | ✅ | **Unmarshal 前写入**——YAML 有值则覆盖，无值则保留 8080；此阶段唯一硬编码默认值 |
+| 3 | `yaml.Unmarshal(contents, config)` | ✅ | 递归调用各自定义 UnmarshalYAML；`yaml:"-"` 字段保持零值 |
+| 4 | `isConfigStateValid(config)` | ❌（只读） | 列数、full 列数量、secret-key 非空、用户名/密码长度等静态约束 |
+| 5 | `widget.initialize()` 遍历 | ✅ | 默认标题/缓存策略/字段必填校验/预渲染 HTML；**不依赖 application** |
+| 6 | `return config` | — | 出口状态：密码仍明文、Theme CSS 未计算、PrimaryColumnIndex 为 0（Go 零值）|
+
+#### 阶段二：newApplication + serveApp onChange（8 步，全部改状态或索引）
+
+| 步骤 | 操作 | 默认值类型 | 关键依赖链 |
+|------|------|-----------|-----------|
+| 1 | Config 复制到 app.Config | — | 取别名 `config = &app.Config`，后续操作均修改 app 内部字段 |
+| 2 | Auth 初始化：Base64 解码 secret-key、bcrypt 哈希密码 | 派生（变换） | 依赖阶段一保证了 SecretKey 非空；明文密码被擦除 |
+| 3 | 主题预设 Merge + presets.init() | 派生（计算） | 内置 dark/light 与用户 presets 合并；生成 CSS/PreviewHTML/BackgroundColorAsHex |
+| 4 | 默认主题 `config.Theme.init()` | 派生（计算） | ⚠️ **输出 `BackgroundColorAsHex`**，后续 Step 6g 依赖此值 |
+| 5 | Pages 初始化：<br>5a PrimaryColumnIndex=-1<br>5b Slug=titleToSlug(Title)<br>5c Slug 保留字校验<br>5d Width "default"→""<br>5e DesktopNavWidth 继承 Width<br>5f/5g Widget 注册 + setProviders | 归一化/继承/派生 | ⚠️ **5e 必须在 5d 之后**（Width 先归一化再被继承）；⚠️ **5g 必须在 5a 之后**（复位后再定位第一个 full 列） |
+| 6 | Branding / URL 默认值：<br>6a BaseURL TrimRight `/`<br>6b Logo/CSS 资产路径解析<br>6c FaviconURL 默认值<br>6d FaviconType 后缀推断<br>6e AppName="Glance"<br>6f AppIconURL 默认值<br>6g AppBackgroundColor=Theme.BackgroundColorAsHex | 归一化/派生 | ⚠️ **6d 依赖 6c**（URL 确定后才能判断后缀）；⚠️ **6g 依赖 Step 4**（theme.init() 必须先算完 BackgroundColorAsHex） |
+| 7 | `manifest.json` 模板执行 | 派生 | 依赖上述所有字段的最终值 |
+| 8 | 热重载错误分流 | 运行时控制 | `hadValidConfigOnStartup` 标志：首次失败 → 退出进程；运行中失败 → 打日志保留旧 server |
