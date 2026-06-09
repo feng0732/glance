@@ -162,11 +162,14 @@ proxy:
 自定义泛型结构体，内部用 `[]K` 保序 + `map[K]V` 存值，详见下文「默认值合并」。
 
 #### widgets — Widget 列表反序列化
-[widgets.UnmarshalYAML](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L95-L124) 的关键流程：
-1. 先解出每个 widget 的 `type` 字段
-2. 根据 type 调用 `newWidget()` 通过 switch 工厂创建对应结构体实例
-3. 将完整节点 Decode 到具体 widget 上
-4. 错误信息携带 `node.Line` 行号，便于定位
+
+[widgets.UnmarshalYAML](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L95-L124) 的执行流程：
+1. 先将外层节点 Decode 为 `[]yaml.Node`（每个 widget 为一个独立节点）
+2. 对每个 widget 节点，先 Decode 出临时结构体 `meta` 中的 `type` 字段
+3. 调用 `newWidget(meta.Type)` 通过 switch 工厂创建具体 widget 结构体实例，并分配全局自增 ID
+4. 将完整 widget 节点 Decode 到具体结构体上
+
+反序列化共有 **5 个报错分支**，定位信息的处理各不相同，详见第 11.4 节。
 
 ---
 
@@ -200,17 +203,18 @@ proxy:
 
 **核心函数**: [newConfigFromYAML](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L94-L129)
 
-此前对"阶段一"的描述存在误导——阶段一并非纯"只读校验"，它包含**6 个顺序步骤**，其中步骤 2、4、6 都会修改 config 或 widget 的内部状态：
+此前对"阶段一"的描述存在误导——阶段一并非纯"只读校验"，它包含**6 个顺序步骤**，其中 Step 1、2、3、5 会修改字节流、config 对象、widget 内部状态或全局计数器：
 
 ```
-Step 1  parseConfigVariables(contents)      ← 修改变量字节流（不涉及 config 对象）
+Step 1  parseConfigVariables(contents)      ← 修改输入字节流（不涉及 config 对象）
    ↓
 Step 2  config := &config{}
-        config.Server.Port = 8080           ← 写入默认端口（⚠️ 在 Unmarshal 之前）
+        config.Server.Port = 8080           ← 修改 config 对象（⚠️ 在 Unmarshal 之前写入）
    ↓
-Step 3  yaml.Unmarshal(contents, config)    ← YAML 字段覆盖零值和 8080 默认值
+Step 3  yaml.Unmarshal(contents, config)    ← 修改 config 对象（填充 YAML 字段）
+                                           ← ⚠️ 内部 widgets.UnmarshalYAML 还递增全局 widgetIDCounter
    ↓
-Step 4  isConfigStateValid(config)          ← 只读校验，不修改数据
+Step 4  isConfigStateValid(config)          ← 只读校验，不修改任何数据
    ↓
 Step 5  遍历 pages/columns/widgets
         widget.initialize()                 ← 修改 widget 内部状态（标题、缓存策略、预渲染等）
@@ -236,15 +240,21 @@ config.Server.Port = 8080   // 先写入默认值
 ### Step 3：yaml.Unmarshal 递归填充结构体
 
 涉及的自定义 UnmarshalYAML（见第 3 章）：
-- `hslColorField.UnmarshalYAML` — 解析 HSL 颜色
-- `durationField.UnmarshalYAML` — 解析 `30s/5m/2h/1d`
-- `customIconField.UnmarshalYAML` — 解析图标前缀（si:/mdi:/di:/sh:）
-- `proxyOptionsField.UnmarshalYAML` — 解析代理（简写 URL 或完整对象），并构造 `*http.Client`
+- `hslColorField.UnmarshalYAML` — 解析 HSL 颜色，内部转为 `hslColor` 结构体
+- `durationField.UnmarshalYAML` — 解析 `30s/5m/2h/1d`，内部转为 `time.Duration`
+- `customIconField.UnmarshalYAML` — 解析图标前缀（si:/mdi:/di:/sh:），内部转为完整 CDN URL + AutoInvert 标志
+- `proxyOptionsField.UnmarshalYAML` — 解析代理（简写 URL 或完整对象），并**构造 `*http.Client`**（包含 Transport + Timeout）
 - `queryParametersField.UnmarshalYAML` — 归一化为 `map[string][]string`
-- `orderedYAMLMap.UnmarshalYAML` — 保序的键值对映射
-- `widgets.UnmarshalYAML` — 按 type 工厂创建具体 widget 结构体
+- `orderedYAMLMap.UnmarshalYAML` — 保序的键值对映射（`[]K` 保序 + `map[K]V` 存值）
+- `widgets.UnmarshalYAML` — 按 type 工厂创建具体 widget 结构体，**并递增全局 `widgetIDCounter`**
 
-**状态变化**：所有 `yaml` tag 标记的字段被填充；`yaml:"-"` 字段（如 `PrimaryColumnIndex`、`user.PasswordHash`、`widgetBase.ID` 等）在此阶段仍为零值。
+**状态变化**：
+1. 所有 `yaml` tag 标记的字段被填充
+2. ⚠️ `widgetBase.ID`（虽为 `yaml:"-"`）在此阶段通过 `newWidget → w.setID(widgetIDCounter.Add(1))` 被赋值为**全局唯一自增 ID**，并非零值
+3. ⚠️ `proxyOptionsField` 内部的 `*http.Client` 在此阶段已构造完成
+4. 其余 `yaml:"-"` 字段（如 `PrimaryColumnIndex`、`user.PasswordHash`、`widgetBase.cacheType` 等）仍为 Go 零值
+
+**全局副作用**：`widgetIDCounter`（`atomic.Uint64`）被多次 `Add(1)`，热重载时每次重新加载都会让计数器从上次的位置继续递增，不会复位。
 
 ### Step 4：isConfigStateValid 只读校验
 
@@ -632,48 +642,119 @@ serveApp() 启动
 
 ---
 
-### 11.4 Widget 反序列化报错定位精确分析
+### 11.4 Widget 反序列化与初始化报错定位精确分析
 
-[widgets.UnmarshalYAML](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L95-L124) 有 4 个可能的错误返回点，行号信息的完整性各不相同：
+Widget 的整个加载流程共 **6 个报错分支**（反序列化 5 个 + initialize 1 个），每个分支的定位信息来源、手动添加方式各不相同。
 
-| 序号 | 代码位置 | 错误场景 | 是否携带行号 | 错误示例 | 原因说明 |
-|------|---------|---------|------------|---------|---------|
-| ① | [L98-L100](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L98-L100) | `node.Decode(&nodes)` 失败（widgets 根节点不是数组） | 否（yaml 库自带位置） | `yaml: unmarshal errors: line 12: cannot unmarshal !!map into []yaml.Node` | 外层 YAML 解析器已记录 token 位置，通常自带行号 |
-| ② | [L107-L109](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L107-L109) | 单个 widget 节点 Decode meta 失败（如 type 字段类型不对） | 否（yaml 库自带位置） | `yaml: unmarshal errors: line 15: cannot unmarshal !!int into string` | 同上，yaml.v3 内部错误已包含行号 |
-| ③ | [L111-L114](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L111-L114) | `newWidget(meta.Type)` 失败（type 为空或未知） | **是，手动拼接** `fmt.Errorf("line %d: %w", node.Line, err)` | `line 17: unknown widget type: foobar` | `newWidget` 返回的是纯语义错误（无 YAML 位置），必须手动追加 `node.Line`。注意这个 `node.Line` 是**列表项节点的起始行**（即 `- type: xxx` 的 `-` 所在行），不一定是 `type:` 字段所在行 |
-| ④ | [L116-L118](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L116-L118) | `node.Decode(widget)` 失败（具体 widget 字段类型错误） | 否（yaml 库自带位置） | `yaml: unmarshal errors: line 20: cannot unmarshal !!str into int` | 具体 widget 结构体解码由 yaml.v3 负责，错误会精确到字段行号 |
-
-#### 阶段一后续：Widget initialize() 错误包装
-
-反序列化成功后，在 [newConfigFromYAML#L112-L126](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L112-L126) 逐个调用 `widget.initialize()`：
+先回顾 [widgets.UnmarshalYAML](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L95-L124) 的完整代码骨架：
 
 ```go
-if err := config.Pages[p].HeadWidgets[w].initialize(); err != nil {
-    return nil, formatWidgetInitError(err, config.Pages[p].HeadWidgets[w])
+func (w *widgets) UnmarshalYAML(node *yaml.Node) error {
+    var nodes []yaml.Node
+    // ─── 分支 A ───
+    if err := node.Decode(&nodes); err != nil { return err }
+
+    for _, node := range nodes {
+        meta := struct { Type string `yaml:"type"` }{}
+        // ─── 分支 B ───
+        if err := node.Decode(&meta); err != nil { return err }
+
+        // ─── 分支 C ───
+        widget, err := newWidget(meta.Type)
+        if err != nil { return fmt.Errorf("line %d: %w", node.Line, err) }
+
+        // ─── 分支 D ───
+        if err = node.Decode(widget); err != nil { return err }
+
+        *w = append(*w, widget)
+    }
+    return nil
 }
 ```
 
-[formatWidgetInitError](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L236-L238) 将错误包装为 `<widget-type> widget: <原始错误>`，**但丢失了行号**——因为此时 widget 结构体已完成反序列化，不再持有原始 `yaml.Node` 的行号信息。
+以及 `newWidget` 内部的两个错误返回 ([widget.go#L20-L91](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L20-L91))：
 
-**易混淆点**：为什么③必须手动加行号而①②④不用？
-- ①②④的错误来自 `yaml.Node.Decode()` 内部，yaml.v3 在解析 token 时已记录源位置，错误信息自动包含 `line N`
-- ③的错误来自 Go 代码的 switch 分支（`newWidget` 工厂），与 YAML token 无关，必须通过闭包捕获外层 `node.Line` 手动拼接
-- 这也解释了为什么 `initialize()` 阶段无法再给出行号——widget 接口里没有 `Line()` 方法，YAML 节点信息在反序列化完成后已丢弃
+```go
+func newWidget(widgetType string) (widget, error) {
+    // ─── 分支 C-1 ───
+    if widgetType == "" {
+        return nil, errors.New("widget 'type' property is empty or not specified")
+    }
+    switch widgetType {
+    case "calendar", "clock", "weather", ...: w = &xxxWidget{}
+    // ─── 分支 C-2 ───
+    default: return nil, fmt.Errorf("unknown widget type: %s", widgetType)
+    }
+    w.setID(widgetIDCounter.Add(1))  // 即使后面出错，计数器已递增
+    return w, nil
+}
+```
+
+#### 6 个报错分支逐一分
+
+| 分支 | 代码位置 | 触发场景 | 定位信息来源 | 是否手动添加 | 错误信息示例 | 补充定位方案 |
+|------|---------|---------|------------|-------------|-------------|------------|
+| **A** | [widget.go#L98-L100](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L98-L100) | `widgets` 根节点不是数组（如写成 map/string） | yaml.v3 内部 token 位置 | ❌ 直接 return err | `yaml: line 42: cannot unmarshal !!map into []yaml.Node` | 可包装 `fmt.Errorf("line %d: widgets list: %w", node.Line, err)` 显式补充根节点行号 |
+| **B** | [widget.go#L107-L109](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L107-L109) | 单个 widget 节点无法解析出 `type` 字段（如 type 写成 int） | yaml.v3 内部 token 位置 | ❌ 直接 return err | `yaml: line 45: cannot unmarshal !!int into string` | 可包装 `fmt.Errorf("line %d: parsing widget type: %w", node.Line, err)` |
+| **C-1** | [widget.go#L21-L23](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L21-L23) | `type` 字段为空字符串或未配置 | 外层手动 `fmt.Errorf("line %d: %w", node.Line, err)` | ✅ 手动加 `node.Line` | `line 47: widget 'type' property is empty or not specified` | 当前已正确处理；`node.Line` 是 `- ` 列表项起始行 |
+| **C-2** | [widget.go#L84-L86](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L84-L86) | `type` 值不在 switch 白名单中 | 同上 | ✅ 手动加 `node.Line` | `line 47: unknown widget type: foobar` | 同上 |
+| **D** | [widget.go#L116-L118](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L116-L118) | 具体 widget 字段类型不匹配（如 `limit: "abc"`） | yaml.v3 内部 token 位置 | ❌ 直接 return err | `yaml: line 50: cannot unmarshal !!str `abc` into int` | 可包装 `fmt.Errorf("line %d: widget %q fields: %w", node.Line, meta.Type, err)` 补充 type 上下文 |
+| **E** | [config.go#L112-L126](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L112-L126) | `widget.initialize()` 失败（必填字段空、格式不合法等） | `formatWidgetInitError` 包装 widget type，**丢失行号** | ❌ 无行号，仅加 type | `reddit widget: subreddit must be specified` | 需在反序列化时将 `node.Line` 存入 widget（如加 `YAMLLine` 字段），或在遍历中维护索引 |
+
+#### 关键定位信息的来源辨析
+
+**yaml.v3 自带行号 vs 手动拼接行号**
+
+- yaml.v3 的 `Node.Decode()` 返回的错误通常包含 `yaml.TypeError`，其 `Errors []string` 中每项形如 `line N: ...`，由库内部在 token 解析时自动记录
+- Go 代码逻辑产生的错误（如 `newWidget` 的 switch default、`initialize()` 的字段校验）与 YAML token 无关，必须手动拼接
+
+**`node.Line` 的准确含义**
+
+在分支 C 中，`node.Line` 指的是：
+> 当前列表项节点的**起始行**，即 `- type: weather` 中 `- ` 字符所在的行号。
+
+若 widget 配置跨多行（如 YAML 中 `- type: weather` 后换行再写其他字段），`node.Line` 是该 widget **第一个 token** 的行号，不一定是出错字段所在行。分支 D 中 yaml.v3 自带的行号则是**出错字段**的精确行号。
+
+#### `widgetIDCounter` 的全局副作用陷阱
+
+[newWidget#L88](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/widget.go#L88) 在 **switch 成功后立即执行** `widgetIDCounter.Add(1)`：
+- 即使后续分支 D `node.Decode(widget)` 失败、整个反序列化报错退出，计数器**已经递增**
+- 热重载时每次重新解析配置，计数器从上一次的值继续累加，**不会复位**
+- 这意味着 widget 的 `ID` 字段是"进程生命周期内单调递增"的，不是"每次配置加载从 1 开始"
+
+#### initialize() 阶段无法定位行号的根因
+
+[formatWidgetInitError](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L236-L238) 仅能拿到 `widget.GetType()`：
+
+```go
+func formatWidgetInitError(err error, widget widget) error {
+    return fmt.Errorf("%s widget: %w", widget.GetType(), err)
+}
+```
+
+丢失行号的原因是信息传递链条断裂：
+1. `widgets.UnmarshalYAML` 中有 `node.Line`
+2. 但 `widget` 接口**没有 `SetYAMLLine()` / `GetYAMLLine()` 方法**
+3. `newConfigFromYAML` 的遍历循环中也没有维护"当前 widget 行号"的外部索引
+
+若要修复，方案有二：
+- 在 `widgetBase` 中加 `YAMLLine int` 字段，在 UnmarshalYAML 中赋值
+- 或在 `newWidget` 返回成功后、`Decode` 之前，把 `node.Line` 写入 widget
 
 ---
 
 ### 11.5 两阶段执行步骤与边界条件汇总表
 
-#### 阶段一：newConfigFromYAML（6 步，3 步修改状态）
+#### 阶段一：newConfigFromYAML（6 步，4 步修改状态 + 1 步全局副作用）
 
 | 步骤 | 操作 | 是否改状态 | 关键细节 / 陷阱 |
 |------|------|-----------|----------------|
 | 1 | `parseConfigVariables(contents)` | ✅（字节流） | `${env}` / `${secret:}` / `${readFileFromEnv:}` 插值；注释中的变量也会被替换 |
-| 2 | `config.Server.Port = 8080` | ✅ | **Unmarshal 前写入**——YAML 有值则覆盖，无值则保留 8080；此阶段唯一硬编码默认值 |
-| 3 | `yaml.Unmarshal(contents, config)` | ✅ | 递归调用各自定义 UnmarshalYAML；`yaml:"-"` 字段保持零值 |
+| 2 | `config.Server.Port = 8080` | ✅（config 对象） | **Unmarshal 前写入**——YAML 有值则覆盖，无值则保留 8080；此阶段唯一硬编码默认值 |
+| 3 | `yaml.Unmarshal(contents, config)` | ✅（config 对象 + 全局） | 递归调用各自定义 UnmarshalYAML；⚠️ `widgetBase.ID`（`yaml:"-"`）通过 `newWidget → widgetIDCounter.Add(1)` 被赋值为全局自增 ID，并非零值；⚠️ `proxyOptionsField` 内部 `*http.Client` 已构造 |
 | 4 | `isConfigStateValid(config)` | ❌（只读） | 列数、full 列数量、secret-key 非空、用户名/密码长度等静态约束 |
-| 5 | `widget.initialize()` 遍历 | ✅ | 默认标题/缓存策略/字段必填校验/预渲染 HTML；**不依赖 application** |
-| 6 | `return config` | — | 出口状态：密码仍明文、Theme CSS 未计算、PrimaryColumnIndex 为 0（Go 零值）|
+| 5 | `widget.initialize()` 遍历 | ✅（widget 内部） | 默认标题/缓存策略/字段必填校验/预渲染 HTML；**不依赖 application** |
+| 6 | `return config` | — | 出口状态：密码仍明文、Theme CSS 未计算、PrimaryColumnIndex 为 0（Go 零值）；widget ID 已全局唯一 |
 
 #### 阶段二：newApplication + serveApp onChange（8 步，全部改状态或索引）
 
