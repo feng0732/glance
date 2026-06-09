@@ -286,8 +286,10 @@ config.Server.Port = 8080   // 先写入默认值
 |------|------|
 | `Server.Port` | 用户值或 8080 |
 | 所有 YAML tag 字段 | 已填充 |
-| `yaml:"-"` 运行时字段 | 除 widget 内部（cacheType/Title 等）外，大多仍为零值（如 `PrimaryColumnIndex=-?` 实际为 0） |
-| widget 内部 | `initialize()` 已执行，默认标题/缓存策略/预渲染已写入 |
+| `yaml:"-"` 运行时字段 | 大部分为 Go 零值（如 `PrimaryColumnIndex=0`、`user.PasswordHash=nil`、`widgetBase.cacheType=0`）；⚠️ **`widgetBase.ID` 已通过 `widgetIDCounter` 赋全局唯一值** |
+| widget 内部（`yaml:"-"`） | `initialize()` 已执行，默认标题/缓存策略/预渲染已写入 |
+| `proxyOptionsField` 内部 | `*http.Client` 已构造 |
+| 全局计数器 `widgetIDCounter` | 已递增 N 次（N = 所有页面 widget 总数），热重载时继续累加不复位 |
 | Auth 密码 | 明文仍在 `user.Password` 字段，未哈希 |
 | Theme CSS / BackgroundColorAsHex | 尚未计算 |
 | slugToPage / widgetByID | 尚未建立索引 |
@@ -555,8 +557,8 @@ debouncedParseAndCompareBeforeCallback (500ms 防抖)
 ## 11. 边界条件与两阶段校验/默认值深度分析
 
 代码 TODO ([config.go#L447-L450](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L447-L450)) 已明确指出当前校验分散在两处。结合第 5、6 章的精确执行顺序分析，**两个阶段都会修改状态**：
-- **阶段一** = [newConfigFromYAML](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L94-L129)：端口默认值写入、YAML 反序列化、widget.initialize() 自洽初始化（共 6 步，其中 3 步修改状态）
-- **阶段二** = [newApplication](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/glance.go#L47-L231) + [serveApp onChange](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/main.go#L101-L146)：归一化/继承/派生默认值、密码哈希、主题 CSS 计算、索引注册、热重载错误分流（共 8 步，全部修改状态或索引）
+- **阶段一** = [newConfigFromYAML](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/config.go#L94-L129)：共 6 步，**4 步修改状态**（Step 1 字节流、Step 2 Port 默认值、Step 3 Unmarshal + 全局计数器、Step 5 widget.initialize），其中 Step 3 附带 **1 个全局副作用**（widgetIDCounter 递增）
+- **阶段二** = [newApplication](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/glance.go#L47-L231) + [serveApp onChange](file:///d:/fz/0601/solo-dogfeeding/code/133-glance/internal/glance/main.go#L101-L146)：共 8 步，全部修改状态或索引（归一化/继承/派生默认值、密码哈希、主题 CSS 计算、索引注册、热重载错误分流）
 
 ### 11.1 认证 secret-key 的两阶段校验
 
