@@ -6,9 +6,9 @@
 
 ## 1. 容器启动流程
 
-### 1.1 ENTRYPOINT 与默认参数
+### 1.1 ENTRYPOINT 与 Docker 参数拼接
 
-Glance 的两个 Dockerfile 均使用相同的 ENTRYPOINT 定义：
+Glance 的两个 Dockerfile 均使用 **exec 形式**的 ENTRYPOINT 定义：
 
 - [Dockerfile](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/Dockerfile#L13-L13)
 - [Dockerfile.goreleaser](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/Dockerfile.goreleaser#L7-L7)
@@ -17,24 +17,107 @@ Glance 的两个 Dockerfile 均使用相同的 ENTRYPOINT 定义：
 ENTRYPOINT ["/app/glance", "--config", "/app/config/glance.yml"]
 ```
 
-容器启动后会执行 `/app/glance` 二进制，并传入 `--config /app/config/glance.yml` 参数。由于使用的是 `ENTRYPOINT` 而非 `CMD`，通过 `docker run glanceapp/glance <args>` 追加的参数会被视为 **子命令**（而非覆盖默认参数）。
+**Docker exec 形式 ENTRYPOINT 的关键行为**：当通过 `docker run glanceapp/glance <user-args>` 追加参数时，`<user-args>` 会被**追加**到 ENTRYPOINT 数组的尾部，而非覆盖。即最终进程的 `os.Args` 为：
 
-### 1.2 CLI 参数解析链路
+```
+["/app/glance", "--config", "/app/config/glance.yml", ...<user-args>
+```
 
-CLI 参数解析位于 [cli.go:parseCliOptions](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/cli.go#L33-L107)。
+这意味着：
+- 不追加任何参数时 → `os.Args[1:] = ["--config", "/app/config/glance.yml"]`
+- 追加 `config:validate` → `os.Args[1:] = ["--config", "/app/config/glance.yml", "config:validate"]`
+- 追加 `--version` → `os.Args[1:] = ["--config", "/app/config/glance.yml", "--version"]`
+- 追加 `--config /other.yml serve` → `os.Args[1:] = ["--config", "/app/config/glance.yml", "--config", "/other.yml", "serve"]`
 
-| 调用形式 | 解析结果 | 对应 intent |
+由于使用 `ENTRYPOINT` 而非 `CMD`，无法通过 `docker run` 参数覆盖掉内置的 `--config /app/config/glance.yml`；如需使用自定义配置路径，必须在追加参数中再次指定 `--config`（flag 包会取最后一次出现的值，见下节）。
+
+---
+
+### 1.2 CLI 参数解析机制详解
+
+CLI 参数解析位于 [cli.go:parseCliOptions](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/cli.go#L33-L107)，整个解析分为三个阶段，存在多个需要注意的交互行为。
+
+#### 阶段一：`--version` 短路判断（第 36-41 行）
+
+```go
+args = os.Args[1:]
+if len(args) == 1 && (args[0] == "--version" || args[0] == "-v" || args[0] == "version") {
+    return &cliOptions{intent: cliIntentVersionPrint}, nil
+}
+```
+
+**该判断在 flag 解析之前执行，且仅当 `len(args) == 1` 时触发。**
+
+| 调用方式 | `os.Args[1:]` | len | 是否触发短路 |
+|---|---|---|---|
+| 二进制直接 `glance --version` | `["--version"]` | 1 | ✅ 触发 |
+| 二进制直接 `glance -v` | `["-v"]` | 1 | ✅ 触发 |
+| 二进制直接 `glance version` | `["version"]` | 1 | ✅ 触发 |
+| 二进制直接 `glance --version --config x.yml` | `["--version", "--config", "x.yml"]` | 3 | ❌ 不触发 |
+| **Docker** `docker run ... --version` | `["--config", "/app/config/glance.yml", "--version"]` | 3 | ❌ 不触发 |
+| **Docker** `docker run ... -v` | `["--config", "/app/config/glance.yml", "-v"]` | 3 | ❌ 不触发 |
+
+> **重要结论**：在 Docker 环境下，由于 ENTRYPOINT 已内置了 `--config` 参数，`len(args)` 至少为 2，**`--version` / `-v` / `version` 的短路判断永远不会命中**。此时这些参数会进入后续的 flag 解析流程。
+
+#### 阶段二：flag 包解析（第 43-64 行）
+
+```go
+flags := flag.NewFlagSet("", flag.ExitOnError)
+configPath := flags.String("config", "glance.yml", "Set config path")
+err := flags.Parse(os.Args[1:])
+```
+
+使用 Go 标准库 `flag` 包，行为特点：
+
+1. **遇到第一个非 flag 参数即停止解析**，剩余参数通过 `flags.Args()` 返回
+2. 同一 flag 多次出现时，**最后一个值生效**
+3. 解析失败时直接 `os.Exit(2)`（由 `flag.ExitOnError` 决定）
+
+| 调用方式（Docker 环境） | flag 解析结果 | `flags.Args()`（剩余非 flag 参数） |
 |---|---|---|
-| `glance`（无参数，即 ENTRYPOINT 默认） | intent = `cliIntentServe`，configPath = `glance.yml`（被 --config 覆盖） | 启动 Web 服务 |
-| `glance --config /path/config.yml` | intent = `cliIntentServe`，configPath = `/path/config.yml` | 启动 Web 服务（指定配置） |
-| `glance --version` / `-v` / `version` | intent = `cliIntentVersionPrint` | 打印版本号 |
-| `glance config:validate` | intent = `cliIntentConfigValidate` | 验证配置文件 |
-| `glance config:print` | intent = `cliIntentConfigPrint` | 打印展开 include 后的配置 |
-| `glance secret:make` | intent = `cliIntentSecretMake` | 生成认证密钥 |
-| `glance password:hash <pwd>` | intent = `cliIntentPasswordHash` | 生成密码哈希 |
-| `glance sensors:print` | intent = `cliIntentSensorsPrint` | 列出传感器 |
-| `glance diagnose` | intent = `cliIntentDiagnose` | 运行诊断 |
-| `glance mountpoint:info <path>` | intent = `cliIntentMountpointInfo` | 打印挂载点信息 |
+| 无追加参数 | `configPath = "/app/config/glance.yml"` | `[]`（空） |
+| 追加 `config:validate` | `configPath = "/app/config/glance.yml"` | `["config:validate"]` |
+| 追加 `--config /other.yml config:validate` | `configPath = "/other.yml"`（最后一个生效） | `["config:validate"]` |
+| 追加 `config:validate --config /other.yml` | `configPath = "/app/config/glance.yml"`（解析在 config:validate 处停止） | `["config:validate", "--config", "/other.yml"]` |
+| 追加 `--version` | flag 包将 `--version` 视为未知 flag → `flag.ExitOnError` 触发退出，打印 `flag provided but not defined: -version` | - |
+| 追加 `-v` | flag 包将 `-v` 视为未知 flag → 同上，退出码 2 | - |
+
+> **关键发现**：在 Docker 环境下执行 `docker run ... --version` 会**直接报错退出**，而非打印版本号。这是 `--version` 短路判断与 Docker ENTRYPOINT 共同作用下的设计缺陷。
+
+#### 阶段三：子命令分发（第 66-100 行）
+
+根据 `flags.Args()` 返回的剩余参数数量进行分支匹配：
+
+```go
+args = flags.Args()
+
+if len(args) == 0 {
+    intent = cliIntentServe          // 默认：启动 Web 服务
+} else if len(args) == 1 {
+    // 匹配 config:validate / config:print / sensors:print / diagnose / secret:make
+} else if len(args) == 2 {
+    // 匹配 password:hash
+} else if len(args) == 2 {        // ⚠️ 死代码，永远不会执行
+    // 匹配 mountpoint:info
+} else {
+    return nil, unknownCommandErr
+}
+```
+
+#### 完整子命令对照表（二进制直接调用场景）：
+
+| 调用形式 | 剩余 args len | 解析结果 | 对应 intent |
+|---|---|---|---|
+| `glance`（无参数） | 0 | intent = `cliIntentServe`，configPath = `glance.yml` | 启动 Web 服务 |
+| `glance --config /path/config.yml` | 0 | intent = `cliIntentServe`，configPath = `/path/config.yml` | 启动 Web 服务（指定配置） |
+| `glance --version` / `-v` / `version` | — | 阶段一短路，直接返回 | 打印版本号 |
+| `glance config:validate` | 1 | intent = `cliIntentConfigValidate` | 验证配置文件 |
+| `glance config:print` | 1 | intent = `cliIntentConfigPrint` | 打印展开 include 后的配置 |
+| `glance secret:make` | 1 | intent = `cliIntentSecretMake` | 生成认证密钥 |
+| `glance sensors:print` | 1 | intent = `cliIntentSensorsPrint` | 列出传感器 |
+| `glance diagnose` | 1 | intent = `cliIntentDiagnose` | 运行诊断 |
+| `glance password:hash <pwd>` | 2 | intent = `cliIntentPasswordHash`，args[1] = `<pwd>` | 生成密码哈希 |
+| `glance mountpoint:info <path>` | 2 | **见下节分析** | — |
 
 启动入口在 [main.go:Main](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/main.go#L15-L91)，根据 intent 分发：
 
@@ -42,7 +125,48 @@ CLI 参数解析位于 [cli.go:parseCliOptions](file:///d:/fz/0601/solo-dogfeedi
 ENTRYPOINT → glance.Main() → parseCliOptions() → cliIntentServe → serveApp(configPath)
 ```
 
-### 1.3 服务启动流程
+---
+
+### 1.3 `mountpoint:info` 子命令可达性分析
+
+**结论：`mountpoint:info` 子命令在当前代码中是不可达的（死代码）。**
+
+问题出在 [cli.go:86-97](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/cli.go#L86-L97) 的条件分支结构：
+
+```go
+} else if len(args) == 2 {
+    if args[0] == "password:hash" {
+        intent = cliIntentPasswordHash
+    } else {
+        return nil, unknownCommandErr
+    }
+} else if len(args) == 2 {   // ← 与上一个分支条件完全相同，永远不会进入
+    if args[0] == "mountpoint:info" {
+        intent = cliIntentMountpointInfo
+    } else {
+        return nil, unknownCommandErr
+    }
+}
+```
+
+两个连续的 `else if len(args) == 2` 分支条件完全相同。当 `len(args) == 2` 时，控制权必然进入第一个分支：
+- 若 `args[0] == "password:hash"` → 设置 intent 为 `cliIntentPasswordHash`，跳出分支
+- 否则 → 返回 `unknown command` 错误，函数提前返回
+
+第二个 `else if len(args) == 2` 分支在语法上合法但逻辑上永远不会被执行。
+
+**实际运行表现**：
+
+| 调用方式 | 预期行为 | 实际行为 |
+|---|---|---|
+| `glance mountpoint:info /app` | 打印挂载点信息 | 输出 `unknown command: mountpoint:info /app`，退出码 1 |
+| Docker 环境下同上 | 同上 | 同上 |
+
+虽然 `cliIntentMountpointInfo` 在 [main.go:56-57](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/main.go#L56-L57) 的 switch 中有对应分支，且 `cliMountpointInfo()` 函数本身实现完整，但由于解析阶段永远不会产生该 intent，这段代码同样不可达。
+
+---
+
+### 1.4 服务启动流程
 
 核心启动逻辑在 [main.go:serveApp](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/main.go#L93-L181)：
 
@@ -69,7 +193,7 @@ volumes:
 
 容器内约定：
 
-| 路径 | 用途 | 是否必须 |
+| 容器内路径 | 用途 | 是否必须 |
 |---|---|---|
 | `/app/config/glance.yml` | 主配置文件（由 ENTRYPOINT 的 `--config` 指定） | 是 |
 | `/app/config/*.yml` | 被主配置 `!include:` 的子配置文件 | 按需 |
@@ -131,7 +255,7 @@ healthcheck:
 
 ### 3.2 以非 root 用户运行的可行方案
 
-由于 Go 二进制为静态编译（`CGO_ENABLED=0`，见 [Dockerfile:5](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/Dockerfile#L5-L5) 和 [.goreleaser.yaml:9](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/.goreleaser.yaml#L9-L9)），不依赖系统库，可直接以任意 uid 运行。
+由于 Go 二进制为静态编译（`CGO_ENABLED=0`，见 [Dockerfile#L5](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/Dockerfile#L5-L5) 和 [.goreleaser.yaml#L9](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/.goreleaser.yaml#L9-L9)），不依赖系统库，可直接以任意 uid 运行。
 
 **docker-compose 方式**：
 
@@ -173,7 +297,7 @@ services:
 |---|---|---|---|
 | linux | amd64 | - | x86_64 |
 | linux | arm64 | - | ARM64 / aarch64 |
-| linux | arm | 7 | ARMv7 (树莓派 2/3) |
+| linux | arm | 7 | ARMv7（树莓派 2/3） |
 | openbsd/freebsd/windows/darwin | 多架构 | - | 仅发布二进制 tarball/zip，不构建 Docker 镜像 |
 
 二进制编译参数：`CGO_ENABLED=0`，ldflags `-s -w` 去除符号表并注入版本号。
@@ -225,8 +349,8 @@ docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 \
 ```
 
 多阶段构建流程（[Dockerfile](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/Dockerfile)）：
-1. **builder 阶段**：`golang:1.26.3-alpine3.22`，在 `/app` 下执行 `CGO_ENABLED=0 go build .`
-2. **最终阶段**：`alpine:3.22`，仅拷贝 `/app/glance` 二进制，WORKDIR=/app，EXPOSE 8080/tcp
+1. **builder 阶段**：`golang:1.26.3-alpine3.22`，在工作目录下执行 `CGO_ENABLED=0 go build .`
+2. **最终阶段**：`alpine:3.22`，仅拷贝二进制文件，WORKDIR=/app，EXPOSE 8080/tcp
 
 ### 4.6 .dockerignore 约定
 
@@ -242,11 +366,28 @@ docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 \
 !main.go
 ```
 
-Dockerfile 本身始终被隐式包含。这样可确保 `docs/`、`.github/` 等大体积非代码文件不进入构建上下文。
+Dockerfile 本身始终被隐式包含。这样可确保文档、CI 配置等大体积非代码文件不进入构建上下文。
 
 ---
 
 ## 5. 快速参考
+
+### Docker 环境下各子命令调用方式
+
+由于 Docker ENTRYPOINT 已内置 `--config /app/config/glance.yml`，需注意以下调用差异：
+
+| 目的 | 二进制直接调用 | Docker 环境调用 | 是否可用 |
+|---|---|---|---|
+| 启动服务 | `glance` 或 `glance --config x.yml` | `docker run ... glanceapp/glance` | ✅ |
+| 指定自定义配置路径 | `glance --config /other.yml` | `docker run ... glanceapp/glance --config /other.yml` | ✅（flag 最后值生效） |
+| 查看版本 | `glance --version` | **不可直接使用**（会被 flag 包报错） | ❌（Docker 环境下） |
+| 验证配置 | `glance config:validate` | `docker run --rm -v ./config:/app/config glanceapp/glance config:validate` | ✅ |
+| 打印配置 | `glance config:print` | `docker run --rm -v ./config:/app/config glanceapp/glance config:print` | ✅ |
+| 生成密钥 | `glance secret:make` | `docker run --rm glanceapp/glance secret:make` | ✅ |
+| 哈希密码 | `glance password:hash mypass` | `docker run --rm glanceapp/glance password:hash mypass` | ✅ |
+| 列出传感器 | `glance sensors:print` | `docker run --rm glanceapp/glance sensors:print` | ✅（容器内可见传感器有限） |
+| 运行诊断 | `glance diagnose` | `docker run --rm glanceapp/glance diagnose` | ✅ |
+| 挂载点信息 | `glance mountpoint:info /path` | **代码不可达**（当前版本 bug） | ❌ |
 
 ### 常用 docker run 命令
 
@@ -266,6 +407,9 @@ docker run --rm -v ./config:/app/config glanceapp/glance config:print
 
 # 生成认证密钥
 docker run --rm glanceapp/glance secret:make
+
+# 生成密码哈希
+docker run --rm glanceapp/glance password:hash 'my-password'
 ```
 
 ### 关键路径速查表
