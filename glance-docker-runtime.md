@@ -10,8 +10,8 @@
 
 Glance 的两个 Dockerfile 均使用 **exec 形式**的 ENTRYPOINT 定义：
 
-- [Dockerfile](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/Dockerfile#L13-L13)
-- [Dockerfile.goreleaser](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/Dockerfile.goreleaser#L7-L7)
+- [Dockerfile](Dockerfile#L13-L13)
+- [Dockerfile.goreleaser](Dockerfile.goreleaser#L7-L7)
 
 ```dockerfile
 ENTRYPOINT ["/app/glance", "--config", "/app/config/glance.yml"]
@@ -35,7 +35,7 @@ ENTRYPOINT ["/app/glance", "--config", "/app/config/glance.yml"]
 
 ### 1.2 CLI 参数解析机制详解
 
-CLI 参数解析位于 [cli.go:parseCliOptions](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/cli.go#L33-L107)，整个解析分为三个阶段，存在多个需要注意的交互行为。
+CLI 参数解析位于 [cli.go:parseCliOptions](internal/glance/cli.go#L33-L107)，整个解析分为三个阶段，存在多个需要注意的交互行为。
 
 #### 阶段一：`--version` 短路判断（第 36-41 行）
 
@@ -119,7 +119,7 @@ if len(args) == 0 {
 | `glance password:hash <pwd>` | 2 | intent = `cliIntentPasswordHash`，args[1] = `<pwd>` | 生成密码哈希 |
 | `glance mountpoint:info <path>` | 2 | **见下节分析** | — |
 
-启动入口在 [main.go:Main](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/main.go#L15-L91)，根据 intent 分发：
+启动入口在 [main.go:Main](internal/glance/main.go#L15-L91)，根据 intent 分发：
 
 ```
 ENTRYPOINT → glance.Main() → parseCliOptions() → cliIntentServe → serveApp(configPath)
@@ -131,7 +131,7 @@ ENTRYPOINT → glance.Main() → parseCliOptions() → cliIntentServe → serveA
 
 **结论：`mountpoint:info` 子命令在当前代码中是不可达的（死代码）。**
 
-问题出在 [cli.go:86-97](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/cli.go#L86-L97) 的条件分支结构：
+问题出在 [cli.go:86-97](internal/glance/cli.go#L86-L97) 的条件分支结构：
 
 ```go
 } else if len(args) == 2 {
@@ -162,18 +162,18 @@ ENTRYPOINT → glance.Main() → parseCliOptions() → cliIntentServe → serveA
 | `glance mountpoint:info /app` | 打印挂载点信息 | 输出 `unknown command: mountpoint:info /app`，退出码 1 |
 | Docker 环境下同上 | 同上 | 同上 |
 
-虽然 `cliIntentMountpointInfo` 在 [main.go:56-57](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/main.go#L56-L57) 的 switch 中有对应分支，且 `cliMountpointInfo()` 函数本身实现完整，但由于解析阶段永远不会产生该 intent，这段代码同样不可达。
+虽然 `cliIntentMountpointInfo` 在 [main.go:56-57](internal/glance/main.go#L56-L57) 的 switch 中有对应分支，且 `cliMountpointInfo()` 函数本身实现完整，但由于解析阶段永远不会产生该 intent，这段代码同样不可达。
 
 ---
 
 ### 1.4 服务启动流程
 
-核心启动逻辑在 [main.go:serveApp](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/main.go#L93-L181)：
+核心启动逻辑在 [main.go:serveApp](internal/glance/main.go#L93-L181)：
 
-1. **解析配置**：调用 `parseYAMLIncludes(configPath)` 递归展开所有 `!include:` / `$include:` 指令，最多递归 20 层（见 [config.go:CONFIG_INCLUDE_RECURSION_DEPTH_LIMIT](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/config.go#L22-L22)）
-2. **启动文件监听器**：`configFilesWatcher()` 使用 fsnotify 监控主配置及所有被 include 的文件，500ms 防抖（见 [config.go:configFilesWatcher](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/config.go#L305-L445)）
+1. **解析配置**：调用 `parseYAMLIncludes(configPath)` 递归展开所有 `!include:` / `$include:` 指令，最多递归 20 层（见 [config.go:CONFIG_INCLUDE_RECURSION_DEPTH_LIMIT](internal/glance/config.go#L22-L22)）
+2. **启动文件监听器**：`configFilesWatcher()` 使用 fsnotify 监控主配置及所有被 include 的文件，500ms 防抖（见 [config.go:configFilesWatcher](internal/glance/config.go#L305-L445)）
 3. **首次加载**：`onChange` 回调被触发，调用 `newConfigFromYAML()` 验证配置并调用 `newApplication()` 构建应用实例
-4. **启动 HTTP 服务器**：`app.server()` 返回 start/stop 闭包，监听地址由 `server.host` 和 `server.port` 决定（默认端口 8080，见 [config.go:newConfigFromYAML](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/config.go#L101-L101)）
+4. **启动 HTTP 服务器**：`app.server()` 返回 start/stop 闭包，监听地址由 `server.host` 和 `server.port` 决定（默认端口 8080，见 [config.go:newConfigFromYAML](internal/glance/config.go#L101-L101)）
 5. **配置热重载**：文件变更后停止旧 server、重建 application、启动新 server
 
 若监听器启动失败（例如某些文件系统不支持 inotify），则退化为一次性加载模式，配置变更需手动重启容器。
@@ -184,7 +184,7 @@ ENTRYPOINT → glance.Main() → parseCliOptions() → cliIntentServe → serveA
 
 ### 2.1 卷挂载路径
 
-官方推荐的 docker-compose 挂载（见 [README.md](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/README.md#L209-L212)）：
+官方推荐的 docker-compose 挂载（见 [README.md](README.md#L209-L212)）：
 
 ```yaml
 volumes:
@@ -203,11 +203,11 @@ volumes:
 ### 2.2 配置文件查找
 
 - 默认查找路径由 `--config` 显式指定，**不会**自动搜索当前工作目录（ENTRYPOINT 已锁定路径）
-- 若主配置不存在，Docker 环境下会触发 v0.7.0 升级提示页面（见 [main.go:serveUpdateNoticeIfConfigLocationNotMigrated](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/main.go#L183-L219)），监听 8080 端口返回 503 和升级说明
+- 若主配置不存在，Docker 环境下会触发 v0.7.0 升级提示页面（见 [main.go:serveUpdateNoticeIfConfigLocationNotMigrated](internal/glance/main.go#L183-L219)），监听 8080 端口返回 503 和升级说明
 
 ### 2.3 配置变量注入
 
-在 [config.go:parseConfigVariables](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/config.go#L142-L187) 中支持三种变量语法：
+在 [config.go:parseConfigVariables](internal/glance/config.go#L142-L187) 中支持三种变量语法：
 
 | 语法 | 解析规则 | 典型用途 |
 |---|---|---|
@@ -223,14 +223,14 @@ volumes:
 
 - **监听范围**：主配置文件 + 所有通过 `!include:` 递归引入的文件
 - **触发事件**：`Write`、`Rename`、`Remove`
-- **防抖**：500ms 内多次变更合并为一次重载（[config.go:debounceDuration](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/config.go#L373-L373)）
+- **防抖**：500ms 内多次变更合并为一次重载（[config.go:debounceDuration](internal/glance/config.go#L373-L373)）
 - **重载失败策略**：启动后首次加载失败 → 容器退出；运行中重载失败 → 保留旧配置并打印日志，不中断服务
 
-> **注意**：Windows 与 Linux 的 rename 语义存在差异，代码中已针对 Linux 的 rename-remove 模式做了重试补偿（[config.go](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/config.go#L400-L422)）。
+> **注意**：Windows 与 Linux 的 rename 语义存在差异，代码中已针对 Linux 的 rename-remove 模式做了重试补偿（[config.go](internal/glance/config.go#L400-L422)）。
 
 ### 2.5 健康检查端点
 
-应用暴露 `/api/healthz` 端点（见 [glance.go](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/internal/glance/glance.go#L449-L451)），始终返回 200 OK，可用于 docker-compose healthcheck：
+应用暴露 `/api/healthz` 端点（见 [glance.go](internal/glance/glance.go#L449-L451)），始终返回 200 OK，可用于 docker-compose healthcheck：
 
 ```yaml
 healthcheck:
@@ -248,14 +248,14 @@ healthcheck:
 
 当前两个 Dockerfile 均 **未创建非 root 用户**，也无 `USER` 指令：
 
-- [Dockerfile](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/Dockerfile)
-- [Dockerfile.goreleaser](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/Dockerfile.goreleaser)
+- [Dockerfile](Dockerfile)
+- [Dockerfile.goreleaser](Dockerfile.goreleaser)
 
 因此容器默认以 `root` (uid=0) 身份运行，WORKDIR 为 `/app`。
 
 ### 3.2 以非 root 用户运行的可行方案
 
-由于 Go 二进制为静态编译（`CGO_ENABLED=0`，见 [Dockerfile#L5](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/Dockerfile#L5-L5) 和 [.goreleaser.yaml#L9](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/.goreleaser.yaml#L9-L9)），不依赖系统库，可直接以任意 uid 运行。
+由于 Go 二进制为静态编译（`CGO_ENABLED=0`，见 [Dockerfile#L5](Dockerfile#L5-L5) 和 [.goreleaser.yaml#L9](.goreleaser.yaml#L9-L9)），不依赖系统库，可直接以任意 uid 运行。
 
 **docker-compose 方式**：
 
@@ -291,7 +291,7 @@ services:
 
 ### 4.1 GoReleaser 构建矩阵
 
-镜像发布由 [.goreleaser.yaml](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/.goreleaser.yaml) 驱动，在 `builds` 节定义了 Go 交叉编译矩阵：
+镜像发布由 [.goreleaser.yaml](.goreleaser.yaml) 驱动，在 `builds` 节定义了 Go 交叉编译矩阵：
 
 | goos | goarch | goarm | 说明 |
 |---|---|---|---|
@@ -304,7 +304,7 @@ services:
 
 ### 4.2 Docker 镜像构建
 
-`.goreleaser.yaml` 的 `dockers` 节定义了三个独立架构镜像，均使用 [Dockerfile.goreleaser](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/Dockerfile.goreleaser) 作为构建模板，使用 `buildx`：
+`.goreleaser.yaml` 的 `dockers` 节定义了三个独立架构镜像，均使用 [Dockerfile.goreleaser](Dockerfile.goreleaser) 作为构建模板，使用 `buildx`：
 
 | 镜像 tag 模板 | 平台 | Go 架构 |
 |---|---|---|
@@ -323,7 +323,7 @@ services:
 
 ### 4.4 CI 触发流程
 
-发布流水线位于 [.github/workflows/release.yaml](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/.github/workflows/release.yaml)：
+发布流水线位于 [.github/workflows/release.yaml](.github/workflows/release.yaml)：
 
 ```
 推送 v* tag → checkout → docker/login-action → setup-go → docker/setup-buildx-action → goreleaser/goreleaser-action release
@@ -337,7 +337,7 @@ GoReleaser 在单次运行中同时完成：
 
 ### 4.5 本地手动构建
 
-若不使用 GoReleaser，可直接使用项目根目录的 [Dockerfile](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/Dockerfile)：
+若不使用 GoReleaser，可直接使用项目根目录的 [Dockerfile](Dockerfile)：
 
 ```bash
 # 构建当前平台镜像
@@ -348,13 +348,13 @@ docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 \
   -t glanceapp/glance:local --push .
 ```
 
-多阶段构建流程（[Dockerfile](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/Dockerfile)）：
+多阶段构建流程（[Dockerfile](Dockerfile)）：
 1. **builder 阶段**：`golang:1.26.3-alpine3.22`，在工作目录下执行 `CGO_ENABLED=0 go build .`
 2. **最终阶段**：`alpine:3.22`，仅拷贝二进制文件，WORKDIR=/app，EXPOSE 8080/tcp
 
 ### 4.6 .dockerignore 约定
 
-[.dockerignore](file:///d:/fz/0601/solo-dogfeeding/code/148-glance/.dockerignore) 使用黑名单模式：默认忽略全部，仅显式放行构建所需路径：
+[.dockerignore](.dockerignore) 使用黑名单模式：默认忽略全部，仅显式放行构建所需路径：
 
 ```
 *
